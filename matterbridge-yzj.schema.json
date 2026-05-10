@@ -1,0 +1,76 @@
+{
+  "title": "matterbridge-yzj plugin",
+  "description": "Bridges yzj-agent devices (KNX / 米家 / 涂鸦 / Lutron / etc.) into Matter via the Matterbridge dynamic-platform API.",
+  "type": "object",
+  "required": [
+    "yzjAgentUrl"
+  ],
+  "properties": {
+    "name": {
+      "description": "Plugin Name",
+      "type": "string",
+      "readOnly": true,
+      "ui:widget": "hidden"
+    },
+    "type": {
+      "description": "Plugin Type",
+      "type": "string",
+      "readOnly": true,
+      "ui:widget": "hidden"
+    },
+    "yzjAgentUrl": {
+      "title": "yzj-agent URL",
+      "description": "Base URL of the local yzj-agent FastAPI. Default http://127.0.0.1:9200 (same Mac mini).",
+      "type": "string",
+      "default": "http://127.0.0.1:9200"
+    },
+    "categoryAllowlist": {
+      "title": "Category allowlist",
+      "description": "Which yzj device categories to bridge to Matter. Defaults cover all controllable types.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "light",
+          "switch",
+          "cover",
+          "scene_controller",
+          "climate",
+          "lock",
+          "sensor"
+        ]
+      },
+      "uniqueItems": true,
+      "default": [
+        "light",
+        "switch",
+        "cover",
+        "scene_controller"
+      ]
+    },
+    "deviceIdBlocklist": {
+      "title": "Device ID blocklist",
+      "description": "Specific yzj device_ids to exclude. Use '{adapter}.{native_id}' format (e.g. 'xiaomi.979836693' to skip a Mi AI Speaker that has category=switch but is not a controllable switch).",
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "uniqueItems": true,
+      "default": [
+        "xiaomi.979836693"
+      ]
+    },
+    "debug": {
+      "title": "Debug logging",
+      "description": "Verbose endpoint logging. Heavy — only enable for troubleshooting.",
+      "type": "boolean",
+      "default": false
+    },
+    "unregisterOnShutdown": {
+      "title": "Unregister on shutdown",
+      "description": "Whether to unregister all bridged endpoints when Matterbridge stops. Default false (keep iOS pairings stable across restarts).",
+      "type": "boolean",
+      "default": false
+    }
+  }
+}
