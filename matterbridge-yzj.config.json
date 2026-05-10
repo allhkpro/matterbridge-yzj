@@ -2,7 +2,15 @@
   "name": "matterbridge-yzj",
   "type": "DynamicPlatform",
   "yzjAgentUrl": "http://127.0.0.1:9200",
-  "categoryAllowlist": ["light", "switch", "cover", "scene_controller", "climate", "lock", "sensor"],
+  "categoryAllowlist": ["light", "switch", "cover", "scene_controller", "climate", "lock", "sensor", "camera"],
+  "deviceIdBlocklist": [
+    "xiaomi.979836693",
+    "unifi_protect.694cfb6c",
+    "unifi_protect.694bf4b0",
+    "unifi_protect.694cf248",
+    "unifi_protect.694d22cc",
+    "unifi_protect.69fee5d8"
+  ],
   "debug": false,
   "unregisterOnShutdown": false
 }

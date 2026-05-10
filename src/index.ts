@@ -39,6 +39,7 @@ import {
   humiditySensor,
   MatterbridgeDynamicPlatform,
   MatterbridgeEndpoint,
+  occupancySensor,
   onOffLight,
   onOffOutlet,
   temperatureSensor,
@@ -54,6 +55,7 @@ import {
   BridgedDeviceBasicInformation,
   DoorLock,
   LevelControl,
+  OccupancySensing,
   OnOff,
   PowerSource,
   RelativeHumidityMeasurement,
@@ -204,10 +206,21 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
       "switch",
       "cover",
       "scene_controller",
+      "climate",
+      "lock",
+      "sensor",
+      "camera",  // 暴露 motion 为 OccupancySensor (视频流走 Homebridge 不在 Matter)
     ]);
 
     this.deviceIdBlocklist = new Set((config.deviceIdBlocklist as string[] | undefined) ?? [
       "xiaomi.979836693",  // Mi AI Speaker Play (音箱不是开关)
+      // UniFi Protect 5 摄像头由 homebridge-unifi-protect 暴露 motion,
+      // 不在 Matter 重复曝光(双桥会让 iOS 自动化重复触发)。
+      "unifi_protect.694cfb6c",  // G5 Turret Ultra
+      "unifi_protect.694bf4b0",  // G4 Doorbell Pro PoE
+      "unifi_protect.694cf248",  // G5 Bullet
+      "unifi_protect.694d22cc",  // G3 Flex
+      "unifi_protect.69fee5d8",  // Camera-69fee5d8
     ]);
 
     this.log.info(
@@ -635,6 +648,28 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
         break;
       }
 
+      case "camera": {
+        // L1-10: 仅把摄像头的 motion (PIR / VMD 运动检测) 暴露成 Matter OccupancySensor。
+        //   - 视频流 / 录像 / live view 不走 Matter (Apple Home 1.5 spec 仅初步支持
+        //     Matter Camera, 远未稳定),那边走 homebridge-unifi-protect /
+        //     homebridge-hikvision-yzj 各自专属 plugin。
+        //   - yzj-agent 海康 adapter 在 state.motion (boolean) 维护实时 PIR 状态,
+        //     SSE 推 state.last_event = {type:"VMD", state:"active|inactive"} 时同步翻
+        //     state.motion。本 plugin SSE handler 把这个翻给 OccupancySensing.occupied。
+        //
+        // categoryAllowlist 配置侧:把 "camera" 加进 allowlist,但 plugin 配置可
+        // 通过 deviceIdBlocklist 排除"我不想暴露 motion"的摄像头(eg. UniFi
+        // 5 台 Protect 已经有 hb-unifi-protect 在跑 motion sensor,加进 blocklist 防双桥)。
+        const initialMotion = dev.state?.motion === true;
+        ep = new MatterbridgeEndpoint([occupancySensor, bridgedNode], { id: safeId }, debug);
+        ep.createDefaultIdentifyClusterServer()
+          .createDefaultBridgedDeviceBasicInformationClusterServer(dev.name, serial, VID, MANUFACTURER, model)
+          .createDefaultOccupancySensingClusterServer(initialMotion);
+        ep.addRequiredClusterServers();
+        // 摄像头 motion 是只读传感器,无 command handler。
+        break;
+      }
+
       case "scene_controller": {
         // L1-6: Pico = composed device with one child per physical button.
         // Each child is a MomentarySwitch. SSE state change → triggerSwitchEvent.
@@ -1001,6 +1036,19 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
     // L1-6: Pico button events (scene_controller only).
     if (cat === "scene_controller" && state.last_event && typeof state.last_event === "object") {
       await this.handlePicoEvent(deviceId, ep, state.last_event as Record<string, unknown>);
+    }
+
+    // L1-10: camera motion → OccupancySensing.occupied (camera only).
+    // yzj-agent 海康 adapter VMD 事件 active/inactive 翻成 state.motion bool,SSE 推这条。
+    // OccupancySensing.occupancy 是 bitmap 但 spec 把 occupied 当 occupancy.occupied 用,
+    // matterbridge setAttribute("occupancy", {occupied: bool}) 直接写 attribute。
+    if (cat === "camera" && typeof state.motion === "boolean") {
+      await ep.setAttribute(
+        OccupancySensing.Cluster.id,
+        "occupancy",
+        { occupied: state.motion },
+        this.log,
+      );
     }
   }
 

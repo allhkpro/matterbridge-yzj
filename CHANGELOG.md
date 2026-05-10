@@ -2,6 +2,39 @@
 
 All notable changes to `matterbridge-yzj` are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/) and [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] — 2026-05-10
+
+### Added
+
+- **L1-10 camera 分支 → Matter OccupancySensor**: yzj `category=camera` 设备(海康摄像头 PIR / VMD 运动检测)的 `state.motion` (boolean) 暴露为 Matter `MA_occupancy (0x0107)` 设备类型 + `OccupancySensing` cluster。SSE state 变化时 `setAttribute("occupancy", { occupied: motion })`。
+  - **视频流 / 录像 / live view 不走 Matter** — Apple Home Matter Camera spec 1.5 还很初期,生产环境用 `homebridge-unifi-protect` 和 `homebridge-hikvision-yzj` 各自专属 plugin 跑。
+  - 默认 `categoryAllowlist` 新增 `"camera"`。
+  - 默认 `deviceIdBlocklist` 预填 5 台 UniFi Protect 摄像头(`unifi_protect.694cfb6c` 等)— 防止 motion 在 Matter + Homebridge 双桥重复触发自动化。yzj 用户在 dashboard 里另外管理 blocklist 即可解禁某些摄像头。
+  - 海康摄像头 (`hikvision.ACHGE7065532`) 默认进 Matter 当 motion sensor;实证 endpoint 171 注册成功,SSE 推送 `OccupancySensing.occupancy { occupied: false }` 干净。
+
+### Architecture context
+
+v0.5.0 是 yzj 主机"双桥并行 → 单桥(Matter)+ 摄像头专桥(Homebridge)"切换的最后一块。配套 yzj-host 这边在 agent launchd plist 里设 `YZJ_DISABLE_HOMEKIT=1` 关掉 HAP-python Bridge,避免灯/Pico/净化器在 iOS 出现两次。
+
+最终架构:
+
+```
+                   iOS Apple Home
+                        ▼
+    ┌───────────────────┴───────────────────┐
+    │                                       │
+Matter Bridge (matterbridge-yzj)      Homebridge
+    setup: 4828167 + 3907             各 plugin 子桥
+    11 endpoints                      ├─ UniFi Protect 5 摄像头 (live + motion)
+    ├─ 3 KNX 灯                       └─ 海康 1 摄像头 (live + RTSPS HKSV 录像)
+    ├─ 3 Pico keypads
+    ├─ 1 Tuya 窗帘
+    ├─ 1 Tuya 插座
+    ├─ 1 Tuya 红外空调 (Climate)
+    ├─ 1 米家空气净化器 (复合: switch + temp/hum/aqi + 滤芯电池)
+    └─ 1 海康 motion (OccupancySensor)
+```
+
 ## [0.4.1] — 2026-05-10
 
 ### Added
