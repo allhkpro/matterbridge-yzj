@@ -2,6 +2,21 @@
 
 All notable changes to `matterbridge-yzj` are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/) and [Semantic Versioning](https://semver.org/).
 
+## [0.4.1] — 2026-05-10
+
+### Added
+
+- **L1-9 Filter life → Matter PowerSource (Replaceable Battery)**: 米家净化器 / 加湿器等 switch 设备如果 state 携带 `filter_life` (0..100 剩余 %)，主端点自动挂 `PowerSource` cluster，按 `filter_life` 阈值映射 `BatChargeLevel`：
+  - `> 30%` → Ok
+  - `10..30%` → Warning
+  - `≤ 10%` → Critical (iOS 卡片头红色电量图标)
+
+  另外推 `batPercentRemaining` (Matter spec 是 0..200 半百分比，所以发 `filter_life * 2`) 和 `batReplacementNeeded` (`filter_life ≤ 5%` 时设 true，触发 iOS"替换电池/滤芯"通知)。语义重用：iOS 把 PowerSource 当电池处理，但 `batReplacementDescription="HEPA filter"` 显式说明它是滤芯，不是真电池。
+
+  实证：xiaomi.357638328 当前 `filter_life=0` → `batPercentRemaining=0`、`batChargeLevel=Critical(2)`、`batReplacementNeeded=true`，iOS 弹"替换 HEPA filter"通知。
+
+- **npm publish 支持**: `package.json` 加 `files` 白名单（dist/ + readme + license + changelog + 配置 + schema）+ `prepublishOnly` 脚本（自动 `rm -rf dist && tsc`）+ `repository` / `bugs` / `homepage` 字段。`.npmignore` 防御性兜底排除 src/ / tsconfig / .github / lock 文件等。`npm pack --dry-run` 验证 tarball ~30 KB / 10 文件，干净到位。新增 README "Publishing to npm" 一节文档化发布流程。
+
 ## [0.4.0] — 2026-05-10
 
 ### Added

@@ -55,6 +55,7 @@ import {
   DoorLock,
   LevelControl,
   OnOff,
+  PowerSource,
   RelativeHumidityMeasurement,
   TemperatureMeasurement,
   Thermostat,
@@ -175,6 +176,10 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
     composedTemp: boolean;
     composedHumidity: boolean;
     composedAqi: boolean;
+    /** L1-9: 净化器/加湿器/除湿器的耗材寿命(滤芯/水箱)曝光成 PowerSource
+     *  Replaceable Battery,iOS Home 在卡片标头显示电量条 + 低于 10% 出红色告警。
+     *  yzj 字段约定 state.filter_life 0..100 (剩余 %)。 */
+    composedFilterLife: boolean;
   }>();
   private allowedCategories: Set<string>;
   private deviceIdBlocklist: Set<string>;
@@ -368,6 +373,7 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
         const composedTemp = dev.category === "switch" && typeof dev.state?.temperature === "number";
         const composedHumidity = dev.category === "switch" && typeof dev.state?.humidity === "number";
         const composedAqi = dev.category === "switch" && typeof dev.state?.aqi === "number";
+        const composedFilterLife = dev.category === "switch" && typeof dev.state?.filter_life === "number";
         this.endpointMeta.set(dev.device_id, {
           category: dev.category,
           hasLevelControl,
@@ -376,6 +382,7 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
           composedTemp,
           composedHumidity,
           composedAqi,
+          composedFilterLife,
         });
         return true;
       }
@@ -576,6 +583,19 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
             .createDefaultIdentifyClusterServer()
             .createDefaultAirQualityClusterServer(this.aqiToEnum(dev.state.aqi as number));
         }
+        // L1-9 filter_life as Replaceable Battery PowerSource on parent.
+        // iOS Home reads BatChargeLevel + batPercentRemaining off this cluster
+        // and shows "替换滤芯" / red battery icon when level=Critical.
+        if (typeof dev.state?.filter_life === "number") {
+          const flLife = Math.max(0, Math.min(100, dev.state.filter_life as number));
+          ep.createDefaultPowerSourceReplaceableBatteryClusterServer(
+            flLife,
+            this.filterLifeToChargeLevel(flLife),
+            1500,                  // dummy voltage (mV)
+            "HEPA filter",         // batReplacementDescription
+            1,                     // batQuantity
+          );
+        }
         break;
       }
 
@@ -648,6 +668,14 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
 
     await this.registerDevice(ep);
     return ep;
+  }
+
+  /** filter_life (0..100 剩余 %) → PowerSource.BatChargeLevel 三档。
+   *  iOS 在 Critical 时图标变红 + 在「家庭」下推送通知。 */
+  private filterLifeToChargeLevel(life: number): PowerSource.BatChargeLevel {
+    if (life > 30) return PowerSource.BatChargeLevel.Ok;
+    if (life > 10) return PowerSource.BatChargeLevel.Warning;
+    return PowerSource.BatChargeLevel.Critical;
   }
 
   /** AQI (PM2.5 μg/m³) → Matter AirQualityEnum 6 级桶。
@@ -879,6 +907,16 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
         if (child) {
           await child.setAttribute(AirQuality.Cluster.id, "airQuality", this.aqiToEnum(state.aqi), this.log);
         }
+      }
+      // L1-9: filter_life — PowerSource cluster on the parent (not on a child).
+      // 同时推 batPercentRemaining 和 batChargeLevel — iOS Home 用 ChargeLevel
+      // 触发红色告警,batPercentRemaining 决定卡片头电量条精确百分比。
+      if (meta?.composedFilterLife && typeof state.filter_life === "number") {
+        const flLife = Math.max(0, Math.min(100, state.filter_life));
+        await ep.setAttribute(PowerSource.Cluster.id, "batPercentRemaining", flLife * 2, this.log);
+        await ep.setAttribute(PowerSource.Cluster.id, "batChargeLevel", this.filterLifeToChargeLevel(flLife), this.log);
+        // iOS 在 batReplacementNeeded=true 时弹通知"替换电池/滤芯",我们 ≤5% 触发。
+        await ep.setAttribute(PowerSource.Cluster.id, "batReplacementNeeded", flLife <= 5, this.log);
       }
     }
 

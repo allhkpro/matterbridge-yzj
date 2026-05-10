@@ -1,0 +1,48 @@
+# 在 package.json files 字段已显式列了要发的内容,这里再防御性兜底排除一些
+# 大概率不该上传 npm 的东西。npm pack 时优先看 files 字段(白名单),
+# 再过 .npmignore 黑名单,再过 .gitignore 兜底。
+
+# 源码 — 我们只发 dist/(已编译)。规避源码意外上传降低噪声。
+src/
+
+# 类型构建中间产物 / 缓存
+*.tsbuildinfo
+.tscache/
+
+# 工程脚手架
+tsconfig.json
+.github/
+.vscode/
+
+# git 元
+.git/
+.gitignore
+
+# 测试 / fixture (本仓暂无,预留)
+test/
+tests/
+__tests__/
+*.test.ts
+*.test.js
+*.spec.ts
+
+# CI / 容器
+.dockerignore
+Dockerfile
+
+# 操作系统垃圾
+.DS_Store
+Thumbs.db
+
+# 依赖锁文件 — 我们 .gitignore 里已忽略,npm publish 时也不要带 lock
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# 节点装机产物
+node_modules/
+
+# 我们自己的临时
+tmp/
+.tmp/
+*.swp

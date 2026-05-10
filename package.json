@@ -1,31 +1,56 @@
 {
   "name": "matterbridge-yzj",
-  "version": "0.4.0",
-  "description": "Matterbridge plugin that bridges yzj-agent (KNX / \u7c73\u5bb6 / \u6d82\u9e26 / Lutron / ...) into Matter. Connects to the local yzj-agent FastAPI on :9200 and exposes each Device as a Matter bridged endpoint.",
+  "version": "0.4.1",
+  "description": "Matterbridge plugin that bridges yzj-agent (KNX / 米家 / 涂鸦 / Lutron / ...) into Matter. Connects to the local yzj-agent FastAPI on :9200 and exposes each Device as a Matter bridged endpoint.",
   "type": "module",
   "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "exports": {
     ".": {
       "import": "./dist/index.js",
       "types": "./dist/index.d.ts"
     }
   },
+  "files": [
+    "dist/",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE.md",
+    "matterbridge-yzj.config.json",
+    "matterbridge-yzj.schema.json"
+  ],
   "engines": {
     "node": ">=20.19.0 <21.0.0 || >=22.13.0 <23.0.0 || >=24.0.0 <25.0.0"
   },
   "scripts": {
     "build": "tsc",
-    "watch": "tsc --watch"
+    "watch": "tsc --watch",
+    "prepublishOnly": "rm -rf dist && tsc",
+    "pack:dry": "npm pack --dry-run"
   },
   "keywords": [
     "matterbridge",
+    "matterbridge-plugin",
     "matter",
+    "matter-protocol",
     "yzj",
     "knx",
-    "smart-home"
+    "tuya",
+    "xiaomi",
+    "lutron",
+    "smart-home",
+    "iot"
   ],
-  "author": "yzj/allhkpro",
+  "author": "yzj/allhkpro <cf100331917@gmail.com> (云之锦智能 / 南京云之锦智能科技有限公司)",
   "license": "MIT",
+  "homepage": "https://github.com/allhkpro/matterbridge-yzj#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/allhkpro/matterbridge-yzj.git"
+  },
+  "bugs": {
+    "url": "https://github.com/allhkpro/matterbridge-yzj/issues"
+  },
   "devDependencies": {
     "@types/node": "^22.19.18",
     "typescript": "^5.9.3"

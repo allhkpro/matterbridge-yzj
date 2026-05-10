@@ -124,6 +124,30 @@ Lutron RA2 Pico keypads register as a composed Matter device with one child `Gen
 | `Constraint "minLevel to maxLevel": Value 0 is not within bounds` | Persisted `currentLevel=0` from older plugin version | Plugin no longer writes 0 to LevelControl; old entries auto-corrected on next state change |
 | iOS shows "no response" for some devices | `BridgedDeviceBasicInformation.Reachable=false` (yzj-agent reports `online: false`) | Check the underlying device / adapter on yzj-agent |
 
+## Publishing to npm
+
+Maintainer-only flow (run after `git push origin vX.Y.Z` and GitHub release are out):
+
+```bash
+# 1) verify the tarball is clean (only dist/ + readme/license/changelog/config/schema)
+npm pack --dry-run
+
+# 2) login (one-time per machine; uses npmjs.com 2FA OTP)
+npm login
+
+# 3) publish — `prepublishOnly` script auto-runs `rm -rf dist && tsc`
+npm publish --access public
+
+# 4) verify on https://www.npmjs.com/package/matterbridge-yzj
+```
+
+Notes:
+
+- `package.json` declares `"files": [...]` whitelist; npm respects it before `.npmignore` and `.gitignore`. The tarball stays minimal (~30 KB).
+- `prepublishOnly` rebuilds `dist/` cleanly. Don't `npm publish` from a stale tree.
+- Tag in git **before** publish so npm version, GitHub release tag, and CHANGELOG entry stay aligned.
+- We use the test CSA Vendor ID `0xfff1` until our own VID is approved. Document this clearly in the npm description so end-users know not to ship it for commercial Matter certification.
+
 ## License
 
 MIT (this fork) + ISC (matterbridge upstream by Luligu).
