@@ -158,15 +158,23 @@ function rgbToHs(r: number, g: number, b: number): [number, number] {
 
 export class YzjPlatform extends MatterbridgeDynamicPlatform {
 
-  /** device_id → { ep, category, light flags } so handleDeviceStateChange can
-   *  gate setAttribute calls per device-type and avoid spamming "cluster not
-   *  found" errors when a sensor SSE event hits a thermostat endpoint. */
+  /** device_id → { ep, category, light flags, composed sensor flags } so
+   *  handleDeviceStateChange can gate setAttribute calls per device-type and
+   *  avoid spamming "cluster not found" errors when a sensor SSE event hits
+   *  a thermostat endpoint. */
   private endpoints = new Map<string, MatterbridgeEndpoint>();
   private endpointMeta = new Map<string, {
     category: string;
     hasLevelControl: boolean;
     hasColorTemp: boolean;
     hasRgb: boolean;
+    /** L1-8 composed sensors: switch-type devices (净化器/加湿器/除湿器) that
+     *  also expose temperature/humidity/aqi in their state get child sensor
+     *  endpoints alongside the main OnOff. iOS Home renders the parent as
+     *  power switch, but a long-press/详情 surfaces the child sensor readings. */
+    composedTemp: boolean;
+    composedHumidity: boolean;
+    composedAqi: boolean;
   }>();
   private allowedCategories: Set<string>;
   private deviceIdBlocklist: Set<string>;
@@ -355,11 +363,19 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
         const hasLevelControl = dev.category === "light" && (
           hasRgb || hasColorTemp || typeof dev.state?.brightness === "number"
         );
+        // L1-8: composed sensors only meaningful on switch devices that carry
+        // env readings in their state (米家净化器 / 加湿器 / 除湿器 etc.).
+        const composedTemp = dev.category === "switch" && typeof dev.state?.temperature === "number";
+        const composedHumidity = dev.category === "switch" && typeof dev.state?.humidity === "number";
+        const composedAqi = dev.category === "switch" && typeof dev.state?.aqi === "number";
         this.endpointMeta.set(dev.device_id, {
           category: dev.category,
           hasLevelControl,
           hasColorTemp,
           hasRgb,
+          composedTemp,
+          composedHumidity,
+          composedAqi,
         });
         return true;
       }
@@ -528,8 +544,8 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
         ep.createDefaultIdentifyClusterServer()
           .createDefaultBridgedDeviceBasicInformationClusterServer(dev.name, serial, VID, MANUFACTURER, model)
           .createDefaultGroupsClusterServer()
-          .createDefaultOnOffClusterServer(this.deriveOnOff(dev))
-          .addRequiredClusterServers();
+          .createDefaultOnOffClusterServer(this.deriveOnOff(dev));
+        ep.addRequiredClusterServers();
 
         ep.addCommandHandler("on", async () => {
           await this.handleCommandSafely(dev.device_id, "turn_on", {});
@@ -537,6 +553,29 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
         ep.addCommandHandler("off", async () => {
           await this.handleCommandSafely(dev.device_id, "turn_off", {});
         });
+
+        // L1-8 composed sensors: 米家净化器 / 加湿器 / 除湿器 等 switch 设备的
+        // state 同时携带 aqi / temperature / humidity 字段。给主 OnOffOutlet 挂
+        // 子 sensor endpoint,iOS Home 一台净化器卡片下能直接看到 PM2.5 / 温度 / 湿度。
+        // 做法跟 Pico keypad 子按键完全同构(addChildDeviceType + 测量 cluster init)。
+        if (typeof dev.state?.temperature === "number") {
+          const tempChild = ep.addChildDeviceType("temp", [temperatureSensor], {});
+          tempChild
+            .createDefaultIdentifyClusterServer()
+            .createDefaultTemperatureMeasurementClusterServer(Math.round((dev.state.temperature as number) * 100));
+        }
+        if (typeof dev.state?.humidity === "number") {
+          const humChild = ep.addChildDeviceType("hum", [humiditySensor], {});
+          humChild
+            .createDefaultIdentifyClusterServer()
+            .createDefaultRelativeHumidityMeasurementClusterServer(Math.round((dev.state.humidity as number) * 100));
+        }
+        if (typeof dev.state?.aqi === "number") {
+          const aqChild = ep.addChildDeviceType("aqi", [airQualitySensor], {});
+          aqChild
+            .createDefaultIdentifyClusterServer()
+            .createDefaultAirQualityClusterServer(this.aqiToEnum(dev.state.aqi as number));
+        }
         break;
       }
 
@@ -609,6 +648,20 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
 
     await this.registerDevice(ep);
     return ep;
+  }
+
+  /** AQI (PM2.5 μg/m³) → Matter AirQualityEnum 6 级桶。
+   *  阈值参考 EPA AQI 表 (PM2.5 sub-index):
+   *    Good 0..50  Fair 51..100  Moderate 101..150  Poor 151..200
+   *    VeryPoor 201..300  ExtremelyPoor 300+
+   *  净化器场景 aqi 是直接 PM2.5 浓度,跟 EPA AQI 数轴近似。 */
+  private aqiToEnum(aqi: number): AirQuality.AirQualityEnum {
+    if (aqi <= 50)  return AirQuality.AirQualityEnum.Good;
+    if (aqi <= 100) return AirQuality.AirQualityEnum.Fair;
+    if (aqi <= 150) return AirQuality.AirQualityEnum.Moderate;
+    if (aqi <= 200) return AirQuality.AirQualityEnum.Poor;
+    if (aqi <= 300) return AirQuality.AirQualityEnum.VeryPoor;
+    return AirQuality.AirQualityEnum.ExtremelyPoor;
   }
 
   /** yzj device.state varies per adapter for on/off representation. */
@@ -804,6 +857,29 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
     if (cat === "light" || cat === "switch") {
       const onOff = this.deriveOnOff({ state } as YzjDevice);
       await ep.setAttribute(OnOff.Cluster.id, "onOff", onOff, this.log);
+    }
+
+    // L1-8 composed sensors push (switch parent → child sensor endpoints).
+    // Use getChildEndpointByName to grab the matching child created at build time.
+    if (cat === "switch") {
+      if (meta?.composedTemp && typeof state.temperature === "number") {
+        const child = ep.getChildEndpointByName("temp");
+        if (child) {
+          await child.setAttribute(TemperatureMeasurement.Cluster.id, "measuredValue", Math.round(state.temperature * 100), this.log);
+        }
+      }
+      if (meta?.composedHumidity && typeof state.humidity === "number") {
+        const child = ep.getChildEndpointByName("hum");
+        if (child) {
+          await child.setAttribute(RelativeHumidityMeasurement.Cluster.id, "measuredValue", Math.round(state.humidity * 100), this.log);
+        }
+      }
+      if (meta?.composedAqi && typeof state.aqi === "number") {
+        const child = ep.getChildEndpointByName("aqi");
+        if (child) {
+          await child.setAttribute(AirQuality.Cluster.id, "airQuality", this.aqiToEnum(state.aqi), this.log);
+        }
+      }
     }
 
     // Brightness → LevelControl (light only, and only if light advertised dimming).

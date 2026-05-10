@@ -2,6 +2,25 @@
 
 All notable changes to `matterbridge-yzj` are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/) and [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] — 2026-05-10
+
+### Added
+
+- **L1-8 Composed sensors on switch devices**: 米家空气净化器 / 加湿器 / 除湿器 等 yzj `category=switch` 设备的 state 同时携带 `temperature` / `humidity` / `aqi` 字段时，主 OnOffOutlet 自动挂三个子 sensor endpoint：
+  - `.temp` → `MA_tempsensor (0x0302)` + `TemperatureMeasurement` cluster
+  - `.hum` → `MA_humiditysensor (0x0307)` + `RelativeHumidityMeasurement` cluster
+  - `.aqi` → `MA_airQualitySensor (0x2c)` + `AirQuality` cluster (PM2.5 → 6 级 EPA AQI 桶映射)
+
+  iOS Apple Home 一台净化器卡片下直接显示温度 / 湿度 / 空气质量读数，无需另开传感器卡片。`aqiToEnum` 阈值跟 EPA AQI sub-index 对齐（≤50 Good，≤100 Fair，≤150 Moderate，≤200 Poor，≤300 VeryPoor，>300 ExtremelyPoor）。
+
+  实现走 Matter "composed device" 模式（addChildDeviceType），跟 Pico keypad 子按键完全同构。SSE state event 携带的 aqi/temperature/humidity 通过 `parent.getChildEndpointByName("temp"|"hum"|"aqi")` 找到对应子端点后 setAttribute。
+
+  实证：xiaomi.357638328（米家净化器）每 30 秒 poll 一轮，AirQuality.airQuality 从 5(VeryPoor) → 4(Poor) 跟随真实 PM2.5 浓度变化。
+
+### Changed
+
+- `endpointMeta` 表新增 `composedTemp` / `composedHumidity` / `composedAqi` 三个布尔，handleDeviceStateChange 按 flag 决定是否要查找子 endpoint 推 measurement。
+
 ## [0.3.2] — 2026-05-10
 
 ### Fixed
