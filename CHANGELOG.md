@@ -2,6 +2,12 @@
 
 All notable changes to `matterbridge-yzj` are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/) and [Semantic Versioning](https://semver.org/).
 
+## [0.3.1] — 2026-05-10
+
+### Fixed
+
+- **Thermostat 初始化 int16 溢出**: `createDefaultHeatingThermostatClusterServer` 内部对入参做 `× 100` 转换为 centi-Celsius，0.3.0 误把入参当成已是 centi-Celsius 再 × 100，导致 28 °C 变成 280 000，触发 `[integer-range] Value 280000 is above the nullable int16 maximum of 32767`。改为传摄氏度原值（`currentTemp, targetTemp, 16, 30`）后，AC 注册为 `MA_thermostat (0x0301)` 成功。SSE 状态推送（`setAttribute("localTemperature", state.current_temp * 100)`）依旧用 centi-Celsius，因为那是 attribute 的写入接口而非助手。
+
 ## [0.3.0] — 2026-05-10
 
 Matter device-type expansion + Pico multi-press discrimination + complete state-update plumbing. Light hierarchy now covers OnOff → Dimmable → ColorTemperature → ExtendedColor; Climate / Lock / Sensor / WindowCovering-with-percentage all wired end-to-end.

@@ -433,6 +433,8 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
         // yzj Climate state: { on, mode, target_temp, current_temp }
         // 红外空调 / 地暖 / 米家 AC. Map to Matter Thermostat with cooling+heating
         // setpoints. iOS Home shows temperature controls + mode picker.
+        // 注意:matterbridge createDefaultHeatingThermostatClusterServer 助手内部
+        // 对入参做 ×100,所以这里传摄氏度原值(不是 centi-℃),否则会溢出 int16。
         const targetTemp = (dev.state?.target_temp as number) ?? 26;
         const currentTemp = (dev.state?.current_temp as number) ?? 25;
 
@@ -440,7 +442,7 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
         ep.createDefaultIdentifyClusterServer()
           .createDefaultBridgedDeviceBasicInformationClusterServer(dev.name, serial, VID, MANUFACTURER, model)
           .createDefaultGroupsClusterServer();
-        ep.createDefaultHeatingThermostatClusterServer(currentTemp * 100, targetTemp * 100, 1600, 3000);
+        ep.createDefaultHeatingThermostatClusterServer(currentTemp, targetTemp, 16, 30);
         ep.addRequiredClusterServers();
 
         // SetpointRaiseLower: amount is signed int8 in 0.1°C steps. We turn into
