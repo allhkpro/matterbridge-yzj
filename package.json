@@ -1,6 +1,6 @@
 {
   "name": "matterbridge-yzj",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Matterbridge plugin that bridges yzj-agent (KNX / 米家 / 涂鸦 / Lutron / ...) into Matter. Connects to the local yzj-agent FastAPI on :9200 and exposes each Device as a Matter bridged endpoint.",
   "type": "module",
   "main": "dist/index.js",

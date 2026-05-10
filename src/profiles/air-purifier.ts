@@ -40,6 +40,7 @@ import {
   bridgedNode,
   humiditySensor,
   MatterbridgeEndpoint,
+  onOffOutlet,
   temperatureSensor,
 } from "matterbridge";
 import {
@@ -70,6 +71,10 @@ interface AirPurifierMeta extends ProfileMeta {
   hasTemp: boolean;
   hasHumidity: boolean;
   hasAqi: boolean;
+  /** 米家附加功能开关 — 跟 hb 米家插件等价的子端点。 */
+  hasChildLock: boolean;
+  hasBuzzer: boolean;
+  hasLed: boolean;
 }
 
 export class AirPurifierProfile extends DeviceProfile {
@@ -125,7 +130,7 @@ export class AirPurifierProfile extends DeviceProfile {
       );
     }
 
-    // 复合子端点(温/湿/AQI)
+    // 复合子端点(温/湿/AQI 三个测量传感器)
     const hasTemp = typeof dev.state?.temperature === "number";
     if (hasTemp) {
       const child = ep.addChildDeviceType("temp", [temperatureSensor], {});
@@ -143,6 +148,52 @@ export class AirPurifierProfile extends DeviceProfile {
       const child = ep.addChildDeviceType("aqi", [airQualitySensor], {});
       child.createDefaultIdentifyClusterServer()
         .createDefaultAirQualityClusterServer(this.aqiToEnum(dev.state.aqi as number));
+    }
+
+    // 米家附加功能子开关(对齐 hb-mi-air-purifier 的 SwitchService):
+    //   .lock   童锁(防儿童误碰按键)
+    //   .buzzer 蜂鸣器静音(关掉后米家本身按键操作不再叮叮叫)
+    //   .led    LED 屏(关掉后净化器顶部圆盘屏熄灭,深夜不刺眼)
+    // 都用 onOffOutlet device-type — Matter 没有原生 child-lock cluster,onOffOutlet
+    // 渲染成 iOS 家庭里的"开关"配件,语义上等价 boolean toggle。
+    const hasChildLock = typeof dev.state?.child_lock === "boolean";
+    if (hasChildLock) {
+      const child = ep.addChildDeviceType("lock", [onOffOutlet], {});
+      child.createDefaultIdentifyClusterServer()
+        .createDefaultGroupsClusterServer()
+        .createDefaultOnOffClusterServer(dev.state.child_lock as boolean);
+      child.addCommandHandler("on", async () => {
+        await ctx.handleCommandSafely(dev.device_id, "turn_on", { child_lock: true });
+      });
+      child.addCommandHandler("off", async () => {
+        await ctx.handleCommandSafely(dev.device_id, "turn_on", { child_lock: false });
+      });
+    }
+    const hasBuzzer = typeof dev.state?.buzzer === "boolean";
+    if (hasBuzzer) {
+      const child = ep.addChildDeviceType("buzzer", [onOffOutlet], {});
+      child.createDefaultIdentifyClusterServer()
+        .createDefaultGroupsClusterServer()
+        .createDefaultOnOffClusterServer(dev.state.buzzer as boolean);
+      child.addCommandHandler("on", async () => {
+        await ctx.handleCommandSafely(dev.device_id, "turn_on", { buzzer: true });
+      });
+      child.addCommandHandler("off", async () => {
+        await ctx.handleCommandSafely(dev.device_id, "turn_on", { buzzer: false });
+      });
+    }
+    const hasLed = typeof dev.state?.led === "boolean";
+    if (hasLed) {
+      const child = ep.addChildDeviceType("led", [onOffOutlet], {});
+      child.createDefaultIdentifyClusterServer()
+        .createDefaultGroupsClusterServer()
+        .createDefaultOnOffClusterServer(dev.state.led as boolean);
+      child.addCommandHandler("on", async () => {
+        await ctx.handleCommandSafely(dev.device_id, "turn_on", { led: true });
+      });
+      child.addCommandHandler("off", async () => {
+        await ctx.handleCommandSafely(dev.device_id, "turn_on", { led: false });
+      });
     }
 
     ep.addRequiredClusterServers();
@@ -182,7 +233,10 @@ export class AirPurifierProfile extends DeviceProfile {
       ctx.log,
     );
 
-    const meta: AirPurifierMeta = { hasFilterLife, hasTemp, hasHumidity, hasAqi };
+    const meta: AirPurifierMeta = {
+      hasFilterLife, hasTemp, hasHumidity, hasAqi,
+      hasChildLock, hasBuzzer, hasLed,
+    };
     return { ep, meta };
   }
 
@@ -247,6 +301,20 @@ export class AirPurifierProfile extends DeviceProfile {
       if (child) {
         await child.setAttribute(AirQuality.Cluster.id, "airQuality", this.aqiToEnum(state.aqi), ctx.log);
       }
+    }
+
+    // 米家附加 boolean 子开关状态同步(物理面板 / 米家 App 改 → iPhone 反映)
+    if (meta.hasChildLock && typeof state.child_lock === "boolean") {
+      const child = ep.getChildEndpointByName("lock");
+      if (child) await child.setAttribute(OnOff.Cluster.id, "onOff", state.child_lock, ctx.log);
+    }
+    if (meta.hasBuzzer && typeof state.buzzer === "boolean") {
+      const child = ep.getChildEndpointByName("buzzer");
+      if (child) await child.setAttribute(OnOff.Cluster.id, "onOff", state.buzzer, ctx.log);
+    }
+    if (meta.hasLed && typeof state.led === "boolean") {
+      const child = ep.getChildEndpointByName("led");
+      if (child) await child.setAttribute(OnOff.Cluster.id, "onOff", state.led, ctx.log);
     }
   }
 

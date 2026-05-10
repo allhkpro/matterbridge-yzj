@@ -2,6 +2,21 @@
 
 All notable changes to `matterbridge-yzj` are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/) and [Semantic Versioning](https://semver.org/).
 
+## [0.6.1] — 2026-05-10
+
+### Added
+
+- **air-purifier profile 对齐 hb-mi-air-purifier 全功能** — 用户反馈 "matter 进来的净化器没 hb 完美",对照 `homebridge-mi-air-purifier` plugin 暴露的 Service 列表补齐 3 个原本缺失的子开关:
+  - `.lock` (子端点 onOffOutlet) — 童锁(state.child_lock),iPhone 家庭 app 单独的开关卡片,关掉防儿童误碰
+  - `.buzzer` (子端点 onOffOutlet) — 蜂鸣器(state.buzzer),关掉后米家硬件按键操作不再叮叮叫
+  - `.led` (子端点 onOffOutlet) — LED 屏(state.led),关掉后净化器顶部圆盘显示熄灭,深夜不刺眼
+- 各子开关 OnOff command handler 直接 `POST /api/agent/devices/<id>/turn_on` body 带 `{child_lock: bool}` / `{buzzer: bool}` / `{led: bool}`,yzj-agent 米家 adapter 已支持这三个字段。
+- pushState SSE 同步:物理面板 / 米家 App 改了状态 → iPhone 反映回来。
+
+### Reference
+
+[`yzj-mac-host docs/19-hb米家插件映射库.md`](https://github.com/allhkpro/yzj-mac-host/blob/main/docs/19-hb%E7%B1%B3%E5%AE%B6%E6%8F%92%E4%BB%B6%E6%98%A0%E5%B0%84%E5%BA%93.md) — 全套 hb 米家社区插件 → yzj profile 映射库。后续 profile 迁移(humidifier / vacuum / yeelight / fan / acpartner)按这个表对照实现。
+
 ## [0.6.0] — 2026-05-10
 
 ### Added (架构 Phase B)
