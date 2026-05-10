@@ -27,20 +27,39 @@
  */
 
 import {
+  airQualitySensor,
   bridgedNode,
+  colorTemperatureLight,
+  contactSensor,
   coverDevice,
   dimmableLight,
+  doorLockDevice,
+  extendedColorLight,
   genericSwitch,
+  humiditySensor,
   MatterbridgeDynamicPlatform,
   MatterbridgeEndpoint,
   onOffLight,
   onOffOutlet,
+  temperatureSensor,
+  thermostatDevice,
   type PlatformConfig,
   type PlatformMatterbridge,
 } from "matterbridge";
 
 import { type AnsiLogger } from "matterbridge/logger";
-import { BridgedDeviceBasicInformation, LevelControl, OnOff, WindowCovering } from "matterbridge/matter/clusters";
+import {
+  AirQuality,
+  BooleanState,
+  BridgedDeviceBasicInformation,
+  DoorLock,
+  LevelControl,
+  OnOff,
+  RelativeHumidityMeasurement,
+  TemperatureMeasurement,
+  Thermostat,
+  WindowCovering,
+} from "matterbridge/matter/clusters";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // yzj-agent IPC types
@@ -93,6 +112,45 @@ const yzjBrightnessToMatterLevel = (b: number): number =>
 // LONG_PRESS_SEC=0.5) so end-user behavior is consistent across HAP and Matter paths.
 const PICO_DOUBLE_WINDOW_MS = 400;
 const PICO_LONG_PRESS_MS = 500;
+
+// HSV → RGB. h ∈ [0,360), s/v ∈ [0,1]. Returns [r,g,b] ∈ [0,255].
+// Used to translate Matter ColorControl moveToHueAndSaturation requests
+// into yzj agent rgb tuples.
+function hsvToRgb(h: number, s: number, v: number): [number, number, number] {
+  const c = v * s;
+  const hh = (h % 360) / 60;
+  const x = c * (1 - Math.abs((hh % 2) - 1));
+  let r = 0, g = 0, b = 0;
+  if (hh < 1)      [r, g, b] = [c, x, 0];
+  else if (hh < 2) [r, g, b] = [x, c, 0];
+  else if (hh < 3) [r, g, b] = [0, c, x];
+  else if (hh < 4) [r, g, b] = [0, x, c];
+  else if (hh < 5) [r, g, b] = [x, 0, c];
+  else             [r, g, b] = [c, 0, x];
+  const m = v - c;
+  return [
+    Math.round((r + m) * 255),
+    Math.round((g + m) * 255),
+    Math.round((b + m) * 255),
+  ];
+}
+
+// RGB → Hue/Saturation. Inputs 0-255. Returns [hue 0-360, sat 0-1].
+// Used to push yzj rgb state into Matter ColorControl currentHue/currentSaturation.
+function rgbToHs(r: number, g: number, b: number): [number, number] {
+  const rf = r / 255, gf = g / 255, bf = b / 255;
+  const max = Math.max(rf, gf, bf);
+  const min = Math.min(rf, gf, bf);
+  const d = max - min;
+  let h = 0;
+  if (d !== 0) {
+    if (max === rf) h = ((gf - bf) / d + (gf < bf ? 6 : 0)) * 60;
+    else if (max === gf) h = ((bf - rf) / d + 2) * 60;
+    else h = ((rf - gf) / d + 4) * 60;
+  }
+  const s = max === 0 ? 0 : d / max;
+  return [h, s];
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Platform
@@ -302,21 +360,30 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
     switch (dev.category) {
 
       case "light": {
-        // L1-1: detect dimming. yzj convention: state.brightness (0-100) present
-        // → DimmableLight (LevelControl + moveToLevel cmd). Otherwise OnOffLight.
+        // L1-1 + L1-2: detect color/RGB capability and choose richest cluster.
+        // yzj convention (per agent/core/devices.py Light schema):
+        //   state: { on, brightness, color_temp?(mired), rgb?[r,g,b] }
+        // Priority:
+        //   - state.rgb (3-tuple) → ExtendedColorLight (full color picker on iOS)
+        //   - state.color_temp present → ColorTemperatureLight (warm/cool slider)
+        //   - state.brightness → DimmableLight (brightness slider)
+        //   - else → OnOffLight
+        const hasRgb = Array.isArray(dev.state?.rgb) && (dev.state.rgb as unknown[]).length === 3;
+        const hasColorTemp = typeof dev.state?.color_temp === "number";
         const dimmable = typeof dev.state?.brightness === "number";
 
-        ep = new MatterbridgeEndpoint(
-          [dimmable ? dimmableLight : onOffLight, bridgedNode],
-          { id: safeId },
-          debug,
-        );
+        const lightType = hasRgb ? extendedColorLight
+                        : hasColorTemp ? colorTemperatureLight
+                        : dimmable ? dimmableLight
+                        : onOffLight;
+
+        ep = new MatterbridgeEndpoint([lightType, bridgedNode], { id: safeId }, debug);
         ep.createDefaultIdentifyClusterServer()
           .createDefaultBridgedDeviceBasicInformationClusterServer(dev.name, serial, VID, MANUFACTURER, model)
           .createDefaultGroupsClusterServer()
           .createDefaultOnOffClusterServer(this.deriveOnOff(dev));
 
-        if (dimmable) {
+        if (dimmable || hasColorTemp || hasRgb) {
           const initialLevel = yzjBrightnessToMatterLevel((dev.state.brightness as number) || 0);
           ep.createDefaultLevelControlClusterServer(initialLevel);
         }
@@ -330,7 +397,7 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
           await this.handleCommandSafely(dev.device_id, "turn_off", {});
         });
 
-        if (dimmable) {
+        if (dimmable || hasColorTemp || hasRgb) {
           ep.addCommandHandler("moveToLevel", async ({ request: { level } }: { request: { level: number } }) => {
             const brightness = matterLevelToYzjBrightness(level);
             await this.handleCommandSafely(dev.device_id, "turn_on", { brightness });
@@ -344,6 +411,93 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
             }
           });
         }
+
+        if (hasColorTemp) {
+          // Matter mireds (153-500 = 6500K-2000K) ↔ yzj mired same
+          ep.addCommandHandler("moveToColorTemperature", async ({ request: { colorTemperatureMireds } }: { request: { colorTemperatureMireds: number } }) => {
+            await this.handleCommandSafely(dev.device_id, "turn_on", { color_temp: colorTemperatureMireds });
+          });
+        }
+
+        if (hasRgb) {
+          // Matter HSV (hue 0-254, sat 0-254) → yzj rgb [r,g,b] 0-255
+          ep.addCommandHandler("moveToHueAndSaturation", async ({ request: { hue, saturation } }: { request: { hue: number; saturation: number } }) => {
+            const rgb = hsvToRgb(hue / 254 * 360, saturation / 254, 1);
+            await this.handleCommandSafely(dev.device_id, "turn_on", { rgb });
+          });
+        }
+        break;
+      }
+
+      case "climate": {
+        // yzj Climate state: { on, mode, target_temp, current_temp }
+        // 红外空调 / 地暖 / 米家 AC. Map to Matter Thermostat with cooling+heating
+        // setpoints. iOS Home shows temperature controls + mode picker.
+        const targetTemp = (dev.state?.target_temp as number) ?? 26;
+        const currentTemp = (dev.state?.current_temp as number) ?? 25;
+
+        ep = new MatterbridgeEndpoint([thermostatDevice, bridgedNode], { id: safeId }, debug);
+        ep.createDefaultIdentifyClusterServer()
+          .createDefaultBridgedDeviceBasicInformationClusterServer(dev.name, serial, VID, MANUFACTURER, model)
+          .createDefaultGroupsClusterServer();
+        ep.createDefaultHeatingThermostatClusterServer(currentTemp * 100, targetTemp * 100, 1600, 3000);
+        ep.addRequiredClusterServers();
+
+        // SetpointRaiseLower: amount is signed int8 in 0.1°C steps. We turn into
+        // an absolute target_temp by reading current and adding amount/10.
+        ep.addCommandHandler("setpointRaiseLower", async ({ request }: { request: { mode: number; amount: number } }) => {
+          const cur = (dev.state?.target_temp as number) ?? 26;
+          const newTarget = Math.max(16, Math.min(30, cur + request.amount / 10));
+          await this.handleCommandSafely(dev.device_id, "turn_on", { target_temp: newTarget });
+        });
+        break;
+      }
+
+      case "lock": {
+        // yzj Lock state: { locked: bool, battery_pct: int }
+        ep = new MatterbridgeEndpoint([doorLockDevice, bridgedNode], { id: safeId }, debug);
+        const initialLocked = dev.state?.locked === true;
+        ep.createDefaultIdentifyClusterServer()
+          .createDefaultBridgedDeviceBasicInformationClusterServer(dev.name, serial, VID, MANUFACTURER, model)
+          .createDefaultDoorLockClusterServer(
+            initialLocked ? DoorLock.LockState.Locked : DoorLock.LockState.Unlocked,
+            DoorLock.LockType.DeadBolt,
+          )
+          .addRequiredClusterServers();
+
+        ep.addCommandHandler("lockDoor", async () => {
+          await this.handleCommandSafely(dev.device_id, "turn_on", {}); // turn_on = lock
+        });
+        ep.addCommandHandler("unlockDoor", async () => {
+          await this.handleCommandSafely(dev.device_id, "turn_off", {}); // turn_off = unlock
+        });
+        break;
+      }
+
+      case "sensor": {
+        // yzj Sensor state: { value: any, unit: str }
+        // Choose Matter cluster by unit string (extensible — fall back to contact sensor).
+        const unit = (dev.state?.unit as string | undefined)?.toLowerCase() ?? "";
+        const value = dev.state?.value;
+        const isTemp = ["c", "°c", "celsius", "f", "fahrenheit"].some(u => unit.includes(u));
+        const isHumidity = ["%", "rh", "humidity"].some(u => unit.includes(u));
+        const isAir = ["aqi", "pm", "co2", "voc"].some(u => unit.includes(u));
+
+        const sensorType = isTemp ? temperatureSensor : isHumidity ? humiditySensor : isAir ? airQualitySensor : contactSensor;
+        ep = new MatterbridgeEndpoint([sensorType, bridgedNode], { id: safeId }, debug);
+        ep.createDefaultIdentifyClusterServer()
+          .createDefaultBridgedDeviceBasicInformationClusterServer(dev.name, serial, VID, MANUFACTURER, model);
+
+        if (isTemp && typeof value === "number") {
+          ep.createDefaultTemperatureMeasurementClusterServer(Math.round(value * 100));
+        } else if (isHumidity && typeof value === "number") {
+          ep.createDefaultRelativeHumidityMeasurementClusterServer(Math.round(value * 100));
+        } else if (isAir) {
+          ep.createDefaultAirQualityClusterServer();
+        } else {
+          ep.createDefaultBooleanStateClusterServer(true);
+        }
+        ep.addRequiredClusterServers();
         break;
       }
 
@@ -365,11 +519,17 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
       }
 
       case "cover": {
+        // yzj Cover state: { position: 0..100 (0=closed,100=open), moving: bool }
+        // Matter currentPositionLiftPercent100ths: 0..10000, 0=open, 10000=closed.
+        const yzjPosition = (dev.state?.position as number | undefined) ?? 0;
+        const initialLiftPct = Math.max(0, Math.min(10000, Math.round((100 - yzjPosition) * 100)));
+
         ep = new MatterbridgeEndpoint([coverDevice, bridgedNode], { id: safeId }, debug);
         ep.createDefaultIdentifyClusterServer()
           .createDefaultBridgedDeviceBasicInformationClusterServer(dev.name, serial, VID, MANUFACTURER, model)
           .createDefaultGroupsClusterServer()
-          .addRequiredClusterServers();
+          .createDefaultWindowCoveringClusterServer(initialLiftPct);
+        ep.addRequiredClusterServers();
 
         ep.addCommandHandler("upOrOpen", async () => {
           await this.handleCommandSafely(dev.device_id, "turn_on", {});
@@ -378,8 +538,19 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
           await this.handleCommandSafely(dev.device_id, "turn_off", {});
         });
         ep.addCommandHandler("stopMotion", async () => {
-          this.log.warn(`cover ${dev.device_id} stopMotion not yet supported by yzj-agent`);
+          // yzj 目前没暴露 stop;退化:发一次 turn_on 让本地控制器 hold 当前位置(米家窗帘行为)。
+          this.log.debug(`cover ${dev.device_id} stopMotion: not natively supported by yzj-agent`);
         });
+        // L1-2 percentage: iOS 拖动百分比时发 goToLiftPercentage(liftPercent100thsValue 0-10000)。
+        // Matter 0=open, 10000=closed → yzj position = 100 - pct/100。
+        ep.addCommandHandler(
+          "goToLiftPercentage",
+          async ({ request: { liftPercent100thsValue } }: { request: { liftPercent100thsValue: number } }) => {
+            const yzjPos = Math.max(0, Math.min(100, Math.round(100 - liftPercent100thsValue / 100)));
+            // yzj 自定义协议:position 通过 turn_on body.position 字段传(adapters 自行解释)。
+            await this.handleCommandSafely(dev.device_id, "turn_on", { position: yzjPos });
+          },
+        );
         break;
       }
 
@@ -620,12 +791,88 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
     }
 
     // Position → WindowCovering (cover devices). yzj 0=closed, 100=open;
-    // Matter currentPositionLiftPercent100ths uses 0=open, 10000=closed.
+    // Matter currentPositionLiftPercent100ths uses 0=open, 10=closed (in 100ths).
     if (typeof state.position === "number") {
       try {
         const pct100ths = Math.max(0, Math.min(10000, Math.round((100 - state.position) * 100)));
         await ep.setAttribute(WindowCovering.Cluster.id, "currentPositionLiftPercent100ths", pct100ths, this.log);
+        await ep.setAttribute(WindowCovering.Cluster.id, "targetPositionLiftPercent100ths", pct100ths, this.log);
       } catch { /* not a cover */ }
+    }
+
+    // Color temperature push: yzj.color_temp (mired) → ColorControl.colorTemperatureMireds.
+    if (typeof state.color_temp === "number") {
+      try {
+        await ep.setAttribute("colorControl", "colorTemperatureMireds", Math.max(153, Math.min(500, Math.round(state.color_temp))), this.log);
+      } catch { /* light without color temp cluster */ }
+    }
+
+    // RGB push: yzj.rgb [r,g,b] 0-255 → ColorControl currentHue/currentSaturation (Matter HSV 0-254).
+    if (Array.isArray(state.rgb) && (state.rgb as unknown[]).length === 3) {
+      try {
+        const [r, g, b] = (state.rgb as number[]).map((v) => Math.max(0, Math.min(255, v)));
+        const [h, s] = rgbToHs(r, g, b);
+        await ep.setAttribute("colorControl", "currentHue", Math.round(h / 360 * 254), this.log);
+        await ep.setAttribute("colorControl", "currentSaturation", Math.round(s * 254), this.log);
+      } catch { /* not a color light */ }
+    }
+
+    // Climate state push: yzj.{current_temp,target_temp} → Thermostat cluster.
+    // Matter setpoints are int16 in centi-degrees Celsius.
+    if (typeof state.current_temp === "number") {
+      try {
+        await ep.setAttribute(Thermostat.Cluster.id, "localTemperature", Math.round(state.current_temp * 100), this.log);
+      } catch { /* not a thermostat */ }
+    }
+    if (typeof state.target_temp === "number") {
+      try {
+        await ep.setAttribute(Thermostat.Cluster.id, "occupiedHeatingSetpoint", Math.round(state.target_temp * 100), this.log);
+      } catch { /* not a thermostat */ }
+    }
+
+    // Lock state push: yzj.locked bool → DoorLock.lockState (Locked=1 / Unlocked=2).
+    if (typeof state.locked === "boolean") {
+      try {
+        await ep.setAttribute(
+          DoorLock.Cluster.id,
+          "lockState",
+          state.locked ? DoorLock.LockState.Locked : DoorLock.LockState.Unlocked,
+          this.log,
+        );
+      } catch { /* not a lock */ }
+    }
+
+    // Sensor value push: yzj.value (with state.unit context). Branch by unit
+    // to set the right measurement cluster. value is centi-degrees (×100) for
+    // temperature; centi-percent for humidity.
+    if (typeof state.value === "number" && typeof state.unit === "string") {
+      const unit = state.unit.toLowerCase();
+      try {
+        if (unit.includes("c") || unit.includes("celsius") || unit === "°c") {
+          await ep.setAttribute(TemperatureMeasurement.Cluster.id, "measuredValue", Math.round(state.value * 100), this.log);
+        } else if (unit.includes("rh") || unit.includes("%") || unit.includes("humidity")) {
+          await ep.setAttribute(RelativeHumidityMeasurement.Cluster.id, "measuredValue", Math.round(state.value * 100), this.log);
+        } else if (unit.includes("aqi") || unit.includes("pm") || unit.includes("co2") || unit.includes("voc")) {
+          // AirQuality is enum 0-5 (Unknown..ExtremelyPoor). Map AQI buckets approximately.
+          const aqi = state.value;
+          const enumVal: AirQuality.AirQualityEnum =
+            aqi <= 50 ? AirQuality.AirQualityEnum.Good
+            : aqi <= 100 ? AirQuality.AirQualityEnum.Fair
+            : aqi <= 150 ? AirQuality.AirQualityEnum.Moderate
+            : aqi <= 200 ? AirQuality.AirQualityEnum.Poor
+            : aqi <= 300 ? AirQuality.AirQualityEnum.VeryPoor
+            : AirQuality.AirQualityEnum.ExtremelyPoor;
+          await ep.setAttribute(AirQuality.Cluster.id, "airQuality", enumVal, this.log);
+        }
+      } catch { /* sensor type mismatch */ }
+    }
+
+    // Contact sensor (door/window): state.value boolean.
+    if (typeof state.value === "boolean") {
+      try {
+        // BooleanState.stateValue: true = closed/contact, false = open/no contact.
+        await ep.setAttribute(BooleanState.Cluster.id, "stateValue", state.value, this.log);
+      } catch { /* not a boolean state device */ }
     }
 
     // L1-6: Pico button events.

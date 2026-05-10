@@ -2,6 +2,25 @@
 
 All notable changes to `matterbridge-yzj` are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/) and [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] — 2026-05-10
+
+Matter device-type expansion + Pico multi-press discrimination + complete state-update plumbing. Light hierarchy now covers OnOff → Dimmable → ColorTemperature → ExtendedColor; Climate / Lock / Sensor / WindowCovering-with-percentage all wired end-to-end.
+
+### Added
+
+- **L1-2 Color light hierarchy**: yzj `light` devices auto-promote based on `state` shape — `state.rgb` (3-tuple) → `ExtendedColorLight` (full color picker on iOS), `state.color_temp` → `ColorTemperatureLight` (warm/cool slider), `state.brightness` → `DimmableLight`, else `OnOffLight`. Adds `moveToColorTemperature` and `moveToHueAndSaturation` command handlers; SSE state push for `color_temp` / `rgb` (with HSV ↔ RGB conversion helpers).
+- **Climate (Thermostat)**: yzj `climate` category with `{on, mode, target_temp, current_temp}` registers as Matter `ThermostatDevice` + `HeatingThermostat` cluster. iOS Home shows current temp + target setpoint controls; `setpointRaiseLower` command handler maps 0.1 °C steps onto yzj `target_temp` (16–30 °C clamp). State push of `current_temp` / `target_temp` via Thermostat cluster `localTemperature` / `occupiedHeatingSetpoint`.
+- **Lock (DoorLock)**: yzj `lock` category with `{locked, battery_pct}` registers as Matter `DoorLockDevice`. `lockDoor` / `unlockDoor` commands map to `turn_on` / `turn_off`. SSE `state.locked` boolean → `DoorLock.lockState` enum (Locked / Unlocked).
+- **Sensors (Temperature / Humidity / AirQuality / Contact)**: yzj `sensor` category routes to the right Matter sensor device-type by inspecting `state.unit` — `c/celsius/°c` → `TemperatureSensor`, `%/rh/humidity` → `HumiditySensor`, `aqi/pm/co2/voc` → `AirQualitySensor` (with bucketed `AirQualityEnum` mapping 0–50 Good … >300 ExtremelyPoor), boolean `value` → `ContactSensor`. Measurement clusters (Temperature / RelativeHumidity) accept yzj `value` × 100 in the SSE handler.
+- **Cover percentage control**: `WindowCovering` cluster now initialised with current lift percentage; `goToLiftPercentage` command handler accepts the iOS percent slider and forwards `position` (0–100) to yzj-agent. SSE `state.position` updates both `currentPositionLiftPercent100ths` and `targetPositionLiftPercent100ths` for accurate iOS rendering.
+- **Pico Single / Double / Long discrimination**: per-(deviceId, btn) state machine in plugin. `press` arms a 500 ms long-press timer; `release` arms a 400 ms double-press window before firing `Single`. Two presses inside the window fire `Double` (and cancel pending Single). A press held > 500 ms fires `Long` (and suppresses trailing Single). Constants match yzj-host docs/15 (`DOUBLE_PRESS_WINDOW_SEC=0.4`, `LONG_PRESS_SEC=0.5`) so Apple Home and HAP-python see consistent behavior.
+- **categoryAllowlist** default now includes `climate`, `lock`, `sensor` so new yzj device categories are bridged automatically.
+- **MIT LICENSE.md** with 云之锦智能 (南京云之锦智能科技有限公司) copyright + upstream credit to Matterbridge / matter.js.
+
+### Changed
+
+- `handleDeviceStateChange` is now a single dispatch table covering OnOff, LevelControl (brightness), WindowCovering (position), ColorControl (color_temp / rgb), Thermostat (current_temp / target_temp), DoorLock (locked), TemperatureMeasurement / RelativeHumidityMeasurement / AirQuality / BooleanState (sensor `value`), Reachable (online), and Pico (`last_event`). Each branch is independently try/catch-guarded so non-applicable clusters silently skip.
+
 ## [0.2.0] — 2026-05-10
 
 Phase 2 + Layer-1 polish complete. 15 yzj devices live-bridged into Apple Home with bidirectional sync.

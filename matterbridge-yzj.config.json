@@ -2,7 +2,7 @@
   "name": "matterbridge-yzj",
   "type": "DynamicPlatform",
   "yzjAgentUrl": "http://127.0.0.1:9200",
-  "categoryAllowlist": ["light", "switch", "cover", "scene_controller"],
+  "categoryAllowlist": ["light", "switch", "cover", "scene_controller", "climate", "lock", "sensor"],
   "debug": false,
   "unregisterOnShutdown": false
 }

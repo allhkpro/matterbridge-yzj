@@ -45,7 +45,10 @@
         "light",
         "switch",
         "cover",
-        "scene_controller"
+        "scene_controller",
+        "climate",
+        "lock",
+        "sensor"
       ]
     },
     "deviceIdBlocklist": {
