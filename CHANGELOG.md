@@ -2,6 +2,16 @@
 
 All notable changes to `matterbridge-yzj` are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/) and [Semantic Versioning](https://semver.org/).
 
+## [0.3.2] — 2026-05-10
+
+### Fixed
+
+- **`setAttribute cluster not found` 红色噪声日志**：`handleDeviceStateChange` 之前对每个 yzj 状态字段都调 `setAttribute`，无关 cluster 的 endpoint 会在 matterbridge `endpoint.log.error` 上打红色错误（且 helper 直接打 `endpoint.log` 而非传入的 log 参数，没法靠 try/catch 抑制）。新增 `endpointMeta` 表（device_id → category + light flags），SSE 状态分发现在按 category 门控：light 才推 OnOff/LevelControl/ColorControl，cover 才推 WindowCovering，climate 才推 Thermostat，lock 才推 DoorLock，sensor 才推测量 cluster。结果是日志里再没有红色 cluster-not-found 行，只剩 "Set endpoint X attribute Y from a to b" 的正常成功条目。
+
+### Changed
+
+- 接口幂等：移除每段 setAttribute 外面那层冗余 try/catch（cluster 已门控 → 不再可能走错），逻辑更直观。
+
 ## [0.3.1] — 2026-05-10
 
 ### Fixed

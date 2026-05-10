@@ -158,7 +158,16 @@ function rgbToHs(r: number, g: number, b: number): [number, number] {
 
 export class YzjPlatform extends MatterbridgeDynamicPlatform {
 
+  /** device_id → { ep, category, light flags } so handleDeviceStateChange can
+   *  gate setAttribute calls per device-type and avoid spamming "cluster not
+   *  found" errors when a sensor SSE event hits a thermostat endpoint. */
   private endpoints = new Map<string, MatterbridgeEndpoint>();
+  private endpointMeta = new Map<string, {
+    category: string;
+    hasLevelControl: boolean;
+    hasColorTemp: boolean;
+    hasRgb: boolean;
+  }>();
   private allowedCategories: Set<string>;
   private deviceIdBlocklist: Set<string>;
   private sseAbort: AbortController | null = null;
@@ -341,6 +350,17 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
       const ep = await this.buildEndpoint(dev);
       if (ep) {
         this.endpoints.set(dev.device_id, ep);
+        const hasRgb = Array.isArray(dev.state?.rgb) && (dev.state.rgb as unknown[]).length === 3;
+        const hasColorTemp = typeof dev.state?.color_temp === "number";
+        const hasLevelControl = dev.category === "light" && (
+          hasRgb || hasColorTemp || typeof dev.state?.brightness === "number"
+        );
+        this.endpointMeta.set(dev.device_id, {
+          category: dev.category,
+          hasLevelControl,
+          hasColorTemp,
+          hasRgb,
+        });
         return true;
       }
     } catch (err) {
@@ -768,94 +788,86 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
       ep = this.endpoints.get(deviceId)!;
     }
 
+    const meta = this.endpointMeta.get(deviceId);
+    const cat = meta?.category ?? "";
+
     // L1-3: Reachable mirror — yzj.online → BridgedDeviceBasicInformation.Reachable
+    // (every bridged endpoint has BridgedDeviceBasicInformation by definition).
     if (typeof state.online === "boolean") {
       try {
         await ep.setAttribute(BridgedDeviceBasicInformation.Cluster.id, "reachable", state.online, this.log);
-      } catch { /* cluster may not have it on all device types */ }
+      } catch { /* shouldn't happen */ }
     }
 
-    // OnOff state push.
-    const onOff = this.deriveOnOff({ state } as YzjDevice);
-    try {
+    // OnOff state push — only for categories that have OnOff cluster:
+    // light / switch / cover (cover has it via WindowCovering? actually no — skip cover).
+    if (cat === "light" || cat === "switch") {
+      const onOff = this.deriveOnOff({ state } as YzjDevice);
       await ep.setAttribute(OnOff.Cluster.id, "onOff", onOff, this.log);
-    } catch { /* device lacks OnOff cluster, skip */ }
-
-    // Brightness → LevelControl (light dimming). Skip when brightness=0 — Matter
-    // LevelControl currentLevel must be >= minLevel (1 by spec); 0 means "off"
-    // which is encoded via OnOff cluster, and we keep last non-zero level so
-    // iOS shows the slider position when light goes back on.
-    if (typeof state.brightness === "number" && state.brightness > 0) {
-      try {
-        const matterLevel = yzjBrightnessToMatterLevel(state.brightness);
-        await ep.setAttribute(LevelControl.Cluster.id, "currentLevel", matterLevel, this.log);
-      } catch { /* not dimmable */ }
     }
 
-    // Position → WindowCovering (cover devices). yzj 0=closed, 100=open;
-    // Matter currentPositionLiftPercent100ths uses 0=open, 10=closed (in 100ths).
-    if (typeof state.position === "number") {
-      try {
-        const pct100ths = Math.max(0, Math.min(10000, Math.round((100 - state.position) * 100)));
-        await ep.setAttribute(WindowCovering.Cluster.id, "currentPositionLiftPercent100ths", pct100ths, this.log);
-        await ep.setAttribute(WindowCovering.Cluster.id, "targetPositionLiftPercent100ths", pct100ths, this.log);
-      } catch { /* not a cover */ }
+    // Brightness → LevelControl (light only, and only if light advertised dimming).
+    if (cat === "light" && meta?.hasLevelControl &&
+        typeof state.brightness === "number" && state.brightness > 0) {
+      const matterLevel = yzjBrightnessToMatterLevel(state.brightness);
+      await ep.setAttribute(LevelControl.Cluster.id, "currentLevel", matterLevel, this.log);
     }
 
-    // Color temperature push: yzj.color_temp (mired) → ColorControl.colorTemperatureMireds.
-    if (typeof state.color_temp === "number") {
-      try {
-        await ep.setAttribute("colorControl", "colorTemperatureMireds", Math.max(153, Math.min(500, Math.round(state.color_temp))), this.log);
-      } catch { /* light without color temp cluster */ }
+    // Position → WindowCovering (cover only).
+    if (cat === "cover" && typeof state.position === "number") {
+      const pct100ths = Math.max(0, Math.min(10000, Math.round((100 - state.position) * 100)));
+      await ep.setAttribute(WindowCovering.Cluster.id, "currentPositionLiftPercent100ths", pct100ths, this.log);
+      await ep.setAttribute(WindowCovering.Cluster.id, "targetPositionLiftPercent100ths", pct100ths, this.log);
     }
 
-    // RGB push: yzj.rgb [r,g,b] 0-255 → ColorControl currentHue/currentSaturation (Matter HSV 0-254).
-    if (Array.isArray(state.rgb) && (state.rgb as unknown[]).length === 3) {
-      try {
-        const [r, g, b] = (state.rgb as number[]).map((v) => Math.max(0, Math.min(255, v)));
-        const [h, s] = rgbToHs(r, g, b);
-        await ep.setAttribute("colorControl", "currentHue", Math.round(h / 360 * 254), this.log);
-        await ep.setAttribute("colorControl", "currentSaturation", Math.round(s * 254), this.log);
-      } catch { /* not a color light */ }
+    // Color temperature → ColorControl.colorTemperatureMireds (light with CT only).
+    if (cat === "light" && meta?.hasColorTemp && typeof state.color_temp === "number") {
+      await ep.setAttribute(
+        "colorControl",
+        "colorTemperatureMireds",
+        Math.max(153, Math.min(500, Math.round(state.color_temp))),
+        this.log,
+      );
     }
 
-    // Climate state push: yzj.{current_temp,target_temp} → Thermostat cluster.
-    // Matter setpoints are int16 in centi-degrees Celsius.
-    if (typeof state.current_temp === "number") {
-      try {
+    // RGB → ColorControl.currentHue/currentSaturation (light with RGB only).
+    if (cat === "light" && meta?.hasRgb &&
+        Array.isArray(state.rgb) && (state.rgb as unknown[]).length === 3) {
+      const [r, g, b] = (state.rgb as number[]).map((v) => Math.max(0, Math.min(255, v)));
+      const [h, s] = rgbToHs(r, g, b);
+      await ep.setAttribute("colorControl", "currentHue", Math.round((h / 360) * 254), this.log);
+      await ep.setAttribute("colorControl", "currentSaturation", Math.round(s * 254), this.log);
+    }
+
+    // Climate state push → Thermostat cluster (climate only).
+    if (cat === "climate") {
+      if (typeof state.current_temp === "number") {
         await ep.setAttribute(Thermostat.Cluster.id, "localTemperature", Math.round(state.current_temp * 100), this.log);
-      } catch { /* not a thermostat */ }
-    }
-    if (typeof state.target_temp === "number") {
-      try {
+      }
+      if (typeof state.target_temp === "number") {
         await ep.setAttribute(Thermostat.Cluster.id, "occupiedHeatingSetpoint", Math.round(state.target_temp * 100), this.log);
-      } catch { /* not a thermostat */ }
+      }
     }
 
-    // Lock state push: yzj.locked bool → DoorLock.lockState (Locked=1 / Unlocked=2).
-    if (typeof state.locked === "boolean") {
-      try {
-        await ep.setAttribute(
-          DoorLock.Cluster.id,
-          "lockState",
-          state.locked ? DoorLock.LockState.Locked : DoorLock.LockState.Unlocked,
-          this.log,
-        );
-      } catch { /* not a lock */ }
+    // Lock state push → DoorLock cluster (lock only).
+    if (cat === "lock" && typeof state.locked === "boolean") {
+      await ep.setAttribute(
+        DoorLock.Cluster.id,
+        "lockState",
+        state.locked ? DoorLock.LockState.Locked : DoorLock.LockState.Unlocked,
+        this.log,
+      );
     }
 
-    // Sensor value push: yzj.value (with state.unit context). Branch by unit
-    // to set the right measurement cluster. value is centi-degrees (×100) for
-    // temperature; centi-percent for humidity.
-    if (typeof state.value === "number" && typeof state.unit === "string") {
-      const unit = state.unit.toLowerCase();
-      try {
+    // Sensor value push (sensor category only). Pick measurement cluster by unit.
+    if (cat === "sensor") {
+      if (typeof state.value === "number" && typeof state.unit === "string") {
+        const unit = state.unit.toLowerCase();
         if (unit.includes("c") || unit.includes("celsius") || unit === "°c") {
           await ep.setAttribute(TemperatureMeasurement.Cluster.id, "measuredValue", Math.round(state.value * 100), this.log);
         } else if (unit.includes("rh") || unit.includes("%") || unit.includes("humidity")) {
           await ep.setAttribute(RelativeHumidityMeasurement.Cluster.id, "measuredValue", Math.round(state.value * 100), this.log);
         } else if (unit.includes("aqi") || unit.includes("pm") || unit.includes("co2") || unit.includes("voc")) {
-          // AirQuality is enum 0-5 (Unknown..ExtremelyPoor). Map AQI buckets approximately.
           const aqi = state.value;
           const enumVal: AirQuality.AirQualityEnum =
             aqi <= 50 ? AirQuality.AirQualityEnum.Good
@@ -866,19 +878,14 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
             : AirQuality.AirQualityEnum.ExtremelyPoor;
           await ep.setAttribute(AirQuality.Cluster.id, "airQuality", enumVal, this.log);
         }
-      } catch { /* sensor type mismatch */ }
-    }
-
-    // Contact sensor (door/window): state.value boolean.
-    if (typeof state.value === "boolean") {
-      try {
-        // BooleanState.stateValue: true = closed/contact, false = open/no contact.
+      } else if (typeof state.value === "boolean") {
+        // Contact sensor: BooleanState.stateValue (true = closed/contact).
         await ep.setAttribute(BooleanState.Cluster.id, "stateValue", state.value, this.log);
-      } catch { /* not a boolean state device */ }
+      }
     }
 
-    // L1-6: Pico button events.
-    if (state.last_event && typeof state.last_event === "object") {
+    // L1-6: Pico button events (scene_controller only).
+    if (cat === "scene_controller" && state.last_event && typeof state.last_event === "object") {
       await this.handlePicoEvent(deviceId, ep, state.last_event as Record<string, unknown>);
     }
   }
@@ -984,6 +991,7 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
     try {
       await this.unregisterDevice(ep);
       this.endpoints.delete(deviceId);
+      this.endpointMeta.delete(deviceId);
       this.log.info(`Hot-removed ${deviceId} from Matter bridge`);
     } catch (err) {
       this.log.error(`Hot-remove ${deviceId} failed: ${(err as Error).message}`);
