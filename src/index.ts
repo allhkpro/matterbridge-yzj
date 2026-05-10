@@ -89,6 +89,11 @@ const matterLevelToYzjBrightness = (level: number): number =>
 const yzjBrightnessToMatterLevel = (b: number): number =>
   Math.max(1, Math.min(254, Math.round((b / 100) * 254)));
 
+// Pico multi-press time windows. Match yzj-host docs/15 (DOUBLE_PRESS_WINDOW_SEC=0.4,
+// LONG_PRESS_SEC=0.5) so end-user behavior is consistent across HAP and Matter paths.
+const PICO_DOUBLE_WINDOW_MS = 400;
+const PICO_LONG_PRESS_MS = 500;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Platform
 // ─────────────────────────────────────────────────────────────────────────────
@@ -99,6 +104,17 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
   private allowedCategories: Set<string>;
   private deviceIdBlocklist: Set<string>;
   private sseAbort: AbortController | null = null;
+
+  /** Per-(deviceId,btn) state machine for Pico multi-press detection.
+   *  Key: "deviceId:btn"。Phase 3 — distinguishes Single / Double / Long
+   *  from yzj raw press/release stream. */
+  private picoState = new Map<string, {
+    pressTs: number;          // last press timestamp (0 = idle)
+    pendingSingleTimer: NodeJS.Timeout | null;  // fires Single after DOUBLE_WINDOW
+    longTimer: NodeJS.Timeout | null;           // fires Long if held > LONG_PRESS_MS
+    longFired: boolean;       // track to suppress trailing Single
+    lastReleaseTs: number;    // for double-press detection
+  }>();
 
   constructor(matterbridge: PlatformMatterbridge, log: AnsiLogger, config: PlatformConfig) {
     super(matterbridge, log, config);
@@ -627,22 +643,81 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
     const action = lastEvent.action;
 
     if (typeof btn !== "number" || typeof action !== "string") return;
-
-    // We only fire on "press" (not "release"). yzj raw stream gives both;
-    // Matter's "Single" press maps cleanly to user intent.
-    if (action !== "press") return;
+    if (action !== "press" && action !== "release") return;
 
     const child = parent.getChildEndpointByName(`btn-${btn}`);
     if (!child) {
-      this.log.debug(`Pico ${deviceId} btn=${btn} press but no child endpoint`);
+      this.log.debug(`Pico ${deviceId} btn=${btn} ${action} but no child endpoint`);
       return;
     }
 
-    try {
-      await child.triggerSwitchEvent("Single", this.log);
-      this.log.info(`Pico ${deviceId} btn=${btn} → Matter Single press`);
-    } catch (err) {
-      this.log.error(`Pico triggerSwitchEvent failed: ${(err as Error).message}`);
+    const key = `${deviceId}:${btn}`;
+    let st = this.picoState.get(key);
+    if (!st) {
+      st = { pressTs: 0, pendingSingleTimer: null, longTimer: null, longFired: false, lastReleaseTs: 0 };
+      this.picoState.set(key, st);
+    }
+
+    const now = Date.now();
+    const fire = async (kind: "Single" | "Double" | "Long"): Promise<void> => {
+      try {
+        await child.triggerSwitchEvent(kind, this.log);
+        this.log.info(`Pico ${deviceId} btn=${btn} → Matter ${kind}`);
+      } catch (err) {
+        this.log.error(`Pico triggerSwitchEvent ${kind} failed: ${(err as Error).message}`);
+      }
+    };
+
+    if (action === "press") {
+      st.pressTs = now;
+
+      // 检测 Double:近 DOUBLE_WINDOW_MS 内已有一次 release(完整一个 click 周期)
+      if (st.pendingSingleTimer && (now - st.lastReleaseTs) < PICO_DOUBLE_WINDOW_MS) {
+        // 取消 pending Single,直接 fire Double
+        clearTimeout(st.pendingSingleTimer);
+        st.pendingSingleTimer = null;
+        await fire("Double");
+        // 清状态(双击周期结束)
+        st.pressTs = 0;
+        st.lastReleaseTs = 0;
+        st.longFired = false;
+        return;
+      }
+
+      // 起 long 计时:如 LONG_PRESS_MS 内不 release,fire Long
+      st.longFired = false;
+      if (st.longTimer) clearTimeout(st.longTimer);
+      st.longTimer = setTimeout(() => {
+        if (st!.pressTs > 0) {  // 仍按住
+          st!.longFired = true;
+          void fire("Long");
+        }
+      }, PICO_LONG_PRESS_MS);
+    } else { // release
+      st.lastReleaseTs = now;
+      const heldMs = now - st.pressTs;
+      st.pressTs = 0;
+      if (st.longTimer) {
+        clearTimeout(st.longTimer);
+        st.longTimer = null;
+      }
+
+      // 已 fire Long → 不再 fire Single
+      if (st.longFired) {
+        st.longFired = false;
+        return;
+      }
+
+      // 普通短按:延迟 DOUBLE_WINDOW_MS 等是否有第二次 press(变 Double)
+      // 没有则 fire Single
+      if (heldMs >= 0) {
+        if (st.pendingSingleTimer) clearTimeout(st.pendingSingleTimer);
+        st.pendingSingleTimer = setTimeout(() => {
+          void fire("Single");
+          st!.pendingSingleTimer = null;
+          st!.lastReleaseTs = 0;
+        }, PICO_DOUBLE_WINDOW_MS);
+      }
     }
   }
 
