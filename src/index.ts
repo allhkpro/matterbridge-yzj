@@ -789,6 +789,7 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
     const seen = new Set<string>();
     let added = 0;
     let synced = 0;
+    let removed = 0;
 
     for (const dev of devices) {
       seen.add(dev.device_id);
@@ -803,18 +804,34 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
       }
     }
 
-    // Mark devices that disappeared as Reachable=false (don't unregister —
-    // they may come back; full unregister happens on adapter.*.removed event).
+    // Devices that disappeared from yzj registry → unregister Matter endpoint。
+    // 之前的策略是只标 Reachable=false 给设备短暂掉线缓冲,但实战发现:
+    //   - Mock adapter 关掉(YZJ_USE_MOCK_ADAPTERS≠1) → 假设备应该从 iOS 家庭 app
+    //     彻底消失,不能停留 "Reachable=false" 占着位置
+    //   - Adapter yaml 删了一台设备 → 该端点应该一并清掉
+    //   - Adapter 真断网了短暂消失 → 短暂设个 reachable=false 也无伤,但 plugin
+    //     重启 SSE 重连必触发 fullStateSync,真断网用 yzj-agent 自己的 online=false
+    //     字段 (handleDeviceStateChange 那边继续 mirror 到 reachable),走 SSE 路径。
+    // 所以 fullStateSync 的语义是 "yzj registry 是真相",从 registry 消失的端点
+    // 一律 unregister。
     for (const [deviceId, ep] of this.endpoints) {
       if (!seen.has(deviceId)) {
         try {
-          await ep.setAttribute(BridgedDeviceBasicInformation.Cluster.id, "reachable", false, this.log);
-        } catch { /* not all endpoints have this cluster */ }
+          await this.unregisterDevice(ep);
+          this.endpoints.delete(deviceId);
+          this.endpointMeta.delete(deviceId);
+          removed++;
+          this.log.info(`fullStateSync: removed ${deviceId} (no longer in yzj registry)`);
+        } catch (err) {
+          this.log.error(`fullStateSync: unregister ${deviceId} failed: ${(err as Error).message}`);
+        }
       }
     }
 
-    if (added > 0 || this.endpoints.size > 0) {
-      this.log.info(`fullStateSync: synced=${synced} added=${added} (total=${this.endpoints.size})`);
+    if (added > 0 || removed > 0 || this.endpoints.size > 0) {
+      this.log.info(
+        `fullStateSync: synced=${synced} added=${added} removed=${removed} (total=${this.endpoints.size})`,
+      );
     }
   }
 

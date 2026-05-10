@@ -2,6 +2,18 @@
 
 All notable changes to `matterbridge-yzj` are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/) and [Semantic Versioning](https://semver.org/).
 
+## [0.5.1] — 2026-05-10
+
+### Changed
+
+- **`fullStateSync` 主动 unregister 离群端点**: 之前看到 yzj registry 里没有的本地端点只标 `reachable=false`,留位占空。改为**主动 unregisterDevice + 删 endpoints/endpointMeta map**,iPhone 家庭 app 端点真消失。
+  - 触发场景:
+    - yzj-host 端关 Mock adapter (`YZJ_USE_MOCK_ADAPTERS≠1`) 导致虚拟设备从 registry 消失
+    - 用户从 adapter yaml 删一台设备 (例如把 knx.yaml 一行去掉)
+    - adapter 真断网 (但断网应通过 `online=false` 走 SSE handleDeviceStateChange 路径标 reachable,跟本逻辑无冲突)
+  - 语义: yzj registry 是 Matter 端点的真相源。
+  - 实证: yzj-host 关 Mock 后,3 个 tuya 假端点(书房窗帘/电视插座/阳台空调红外)自动从 matter 端 unregistered,从 11 → 8 端点(全真设备)。
+
 ## [0.5.0] — 2026-05-10
 
 ### Added
