@@ -27,6 +27,7 @@
  */
 
 import {
+  airPurifier,
   airQualitySensor,
   bridgedNode,
   colorTemperatureLight,
@@ -54,11 +55,12 @@ import {
   BooleanState,
   BridgedDeviceBasicInformation,
   DoorLock,
+  HepaFilterMonitoring,
   LevelControl,
   OccupancySensing,
   OnOff,
-  PowerSource,
   RelativeHumidityMeasurement,
+  ResourceMonitoring,
   TemperatureMeasurement,
   Thermostat,
   WindowCovering,
@@ -560,11 +562,39 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
       }
 
       case "switch": {
-        ep = new MatterbridgeEndpoint([onOffOutlet, bridgedNode], { id: safeId }, debug);
-        ep.createDefaultIdentifyClusterServer()
-          .createDefaultBridgedDeviceBasicInformationClusterServer(dev.name, serial, VID, MANUFACTURER, model)
-          .createDefaultGroupsClusterServer()
-          .createDefaultOnOffClusterServer(this.deriveOnOff(dev));
+        // L1-8 / v0.5.2: 净化器特征探测 — yzj category=switch + state 含 aqi 字段 →
+        // 用 Matter 真正的 airPurifier device-type (MA_airPurifier 0x002D),
+        // 不再用 onOffOutlet。iOS Apple Home 18+ 识别 air purifier,出独立的"净化器"
+        // 卡片图标(不是插座)。滤芯走 HepaFilterMonitoring cluster(不再用
+        // PowerSource Replaceable Battery 假装电池 — 那种用法语义错,iOS 显示
+        // "电池电量低" 误导客户以为真没电了。
+        const isAirPurifier = typeof dev.state?.aqi === "number";
+
+        if (isAirPurifier) {
+          ep = new MatterbridgeEndpoint([airPurifier, bridgedNode], { id: safeId }, debug);
+          ep.createDefaultIdentifyClusterServer()
+            .createDefaultBridgedDeviceBasicInformationClusterServer(dev.name, serial, VID, MANUFACTURER, model)
+            .createDefaultGroupsClusterServer()
+            .createDefaultOnOffClusterServer(this.deriveOnOff(dev));
+          // HepaFilterMonitoring cluster: 滤芯 condition (0..100) + Ok/Warning/Critical
+          if (typeof dev.state?.filter_life === "number") {
+            const flLife = Math.max(0, Math.min(100, dev.state.filter_life as number));
+            ep.createDefaultHepaFilterMonitoringClusterServer(
+              flLife,
+              this.filterLifeToChangeIndication(flLife),
+              true,                  // inPlaceIndicator: 滤芯安装着
+              null,                  // lastChangedTime 不知道
+              [],                    // replacementProductList: HEPA 部件号清单(暂空)
+            );
+          }
+        } else {
+          // 普通插座 / 单路开关 (无 aqi 字段) → onOffOutlet
+          ep = new MatterbridgeEndpoint([onOffOutlet, bridgedNode], { id: safeId }, debug);
+          ep.createDefaultIdentifyClusterServer()
+            .createDefaultBridgedDeviceBasicInformationClusterServer(dev.name, serial, VID, MANUFACTURER, model)
+            .createDefaultGroupsClusterServer()
+            .createDefaultOnOffClusterServer(this.deriveOnOff(dev));
+        }
         ep.addRequiredClusterServers();
 
         ep.addCommandHandler("on", async () => {
@@ -574,10 +604,8 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
           await this.handleCommandSafely(dev.device_id, "turn_off", {});
         });
 
-        // L1-8 composed sensors: 米家净化器 / 加湿器 / 除湿器 等 switch 设备的
-        // state 同时携带 aqi / temperature / humidity 字段。给主 OnOffOutlet 挂
-        // 子 sensor endpoint,iOS Home 一台净化器卡片下能直接看到 PM2.5 / 温度 / 湿度。
-        // 做法跟 Pico keypad 子按键完全同构(addChildDeviceType + 测量 cluster init)。
+        // 复合子 sensor: 净化器 / 加湿器 等同时携带 temperature / humidity / aqi 时挂上,
+        // iOS 卡片下方显示读数。
         if (typeof dev.state?.temperature === "number") {
           const tempChild = ep.addChildDeviceType("temp", [temperatureSensor], {});
           tempChild
@@ -595,19 +623,6 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
           aqChild
             .createDefaultIdentifyClusterServer()
             .createDefaultAirQualityClusterServer(this.aqiToEnum(dev.state.aqi as number));
-        }
-        // L1-9 filter_life as Replaceable Battery PowerSource on parent.
-        // iOS Home reads BatChargeLevel + batPercentRemaining off this cluster
-        // and shows "替换滤芯" / red battery icon when level=Critical.
-        if (typeof dev.state?.filter_life === "number") {
-          const flLife = Math.max(0, Math.min(100, dev.state.filter_life as number));
-          ep.createDefaultPowerSourceReplaceableBatteryClusterServer(
-            flLife,
-            this.filterLifeToChargeLevel(flLife),
-            1500,                  // dummy voltage (mV)
-            "HEPA filter",         // batReplacementDescription
-            1,                     // batQuantity
-          );
         }
         break;
       }
@@ -705,12 +720,15 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
     return ep;
   }
 
-  /** filter_life (0..100 剩余 %) → PowerSource.BatChargeLevel 三档。
-   *  iOS 在 Critical 时图标变红 + 在「家庭」下推送通知。 */
-  private filterLifeToChargeLevel(life: number): PowerSource.BatChargeLevel {
-    if (life > 30) return PowerSource.BatChargeLevel.Ok;
-    if (life > 10) return PowerSource.BatChargeLevel.Warning;
-    return PowerSource.BatChargeLevel.Critical;
+  /** filter_life (0..100 剩余 %) → ResourceMonitoring.ChangeIndication 三档。
+   *  iOS Apple Home 在 Warning/Critical 时弹"该换 HEPA 滤芯了"通知。
+   *  注:不再用 PowerSource.BatChargeLevel(那种用法 iOS 显示成"电池电量低",
+   *  误导客户以为电源出问题)。HepaFilterMonitoring cluster 是 Matter spec
+   *  专门给净化器 / 空调滤网 / 加湿器水槽这类耗材设计的。 */
+  private filterLifeToChangeIndication(life: number): ResourceMonitoring.ChangeIndication {
+    if (life > 30) return ResourceMonitoring.ChangeIndication.Ok;
+    if (life > 10) return ResourceMonitoring.ChangeIndication.Warning;
+    return ResourceMonitoring.ChangeIndication.Critical;
   }
 
   /** AQI (PM2.5 μg/m³) → Matter AirQualityEnum 6 级桶。
@@ -960,15 +978,19 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
           await child.setAttribute(AirQuality.Cluster.id, "airQuality", this.aqiToEnum(state.aqi), this.log);
         }
       }
-      // L1-9: filter_life — PowerSource cluster on the parent (not on a child).
-      // 同时推 batPercentRemaining 和 batChargeLevel — iOS Home 用 ChargeLevel
-      // 触发红色告警,batPercentRemaining 决定卡片头电量条精确百分比。
+      // v0.5.2: filter_life → HepaFilterMonitoring cluster (parent endpoint)。
+      // 改用 ResourceMonitoring (HepaFilter sub-cluster) 代替之前的 PowerSource 假电池,
+      // iOS 不再误认为"电池电量低"。HepaFilterMonitoring 才是 Matter spec 给净化器
+      // 滤芯设计的正确语义。
       if (meta?.composedFilterLife && typeof state.filter_life === "number") {
         const flLife = Math.max(0, Math.min(100, state.filter_life));
-        await ep.setAttribute(PowerSource.Cluster.id, "batPercentRemaining", flLife * 2, this.log);
-        await ep.setAttribute(PowerSource.Cluster.id, "batChargeLevel", this.filterLifeToChargeLevel(flLife), this.log);
-        // iOS 在 batReplacementNeeded=true 时弹通知"替换电池/滤芯",我们 ≤5% 触发。
-        await ep.setAttribute(PowerSource.Cluster.id, "batReplacementNeeded", flLife <= 5, this.log);
+        await ep.setAttribute(HepaFilterMonitoring.Cluster.id, "condition", flLife, this.log);
+        await ep.setAttribute(
+          HepaFilterMonitoring.Cluster.id,
+          "changeIndication",
+          this.filterLifeToChangeIndication(flLife),
+          this.log,
+        );
       }
     }
 

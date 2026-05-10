@@ -2,6 +2,17 @@
 
 All notable changes to `matterbridge-yzj` are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/) and [Semantic Versioning](https://semver.org/).
 
+## [0.5.2] — 2026-05-10
+
+### Fixed
+
+- **空气净化器现在是净化器,不再是插座/电池**: 之前 yzj `category=switch` + `state.aqi` 字段(米家空气净化器特征)被映射成 `MA_onoffpluginunit` (插座) + `PowerSource (Replaceable Battery)` cluster — iOS Apple Home 把它显示成插座 + "电池电量低"通知,语义错误,客户混淆以为设备真没电了。
+- 改为正确的 Matter device-type **`MA_airPurifier (0x2d)`** + **`HepaFilterMonitoring`** cluster (Matter spec 给净化器 / 空调滤网这类耗材专门的 cluster):
+  - iOS Home 显示成"空气净化器"图标(不是插座)
+  - 滤芯寿命走 `condition` (0..100) + `changeIndication` (Ok / Warning / Critical) — Critical 时弹"该换 HEPA 滤芯了" 通知,语义对了
+  - matterbridge 自动加 `fanControl` cluster (净化器 device-type 必带),将来可接入风速档位
+- 触发条件: yzj `category=switch` + `state.aqi` 是数字 → 升级到 `airPurifier`。普通插座(无 aqi) 仍是 `onOffOutlet`。
+
 ## [0.5.1] — 2026-05-10
 
 ### Changed
