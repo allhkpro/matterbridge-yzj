@@ -2,6 +2,32 @@
 
 All notable changes to `matterbridge-yzj` are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/) and [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] — 2026-05-10
+
+### Added (架构 Phase B)
+
+- **Profile framework — 数据驱动设备类型路由**: 之前 `buildEndpoint` 一个超长 switch case 按 `category × state` 写设备类型映射,加新型号要改 ts 代码。v0.6.0 抽出独立 profile 框架:
+  - `src/profiles/types.ts` 抽象基类 `DeviceProfile`(buildEndpoint + pushState + match rule)
+  - `src/profiles/router.ts` 顺序匹配,first-hit-wins
+  - `src/profiles/register.ts` 集中注册 profile 数组(顺序决定优先级)
+  - `src/profiles/<kind>.ts` 每类设备一个独立文件,聚焦该设备类的所有逻辑
+- **air-purifier profile** 首迁 — 米家空气净化器(zhimi.airpurifier 系列)从 index.ts 主流程提取到 `src/profiles/air-purifier.ts`:
+  - 自带 OnOff / FanControl-MultiSpeed (16 速 + Auto) / HepaFilterMonitoring + 3 子端点 (temp/hum/aqi)
+  - 完整 cluster 初始化 + iPhone 写 attribute → yzj 命令路由 + SSE state 同步
+  - 跟之前 v0.5.3 表达力等价,**行为不变**
+
+### Changed
+
+- **`tryRegisterDevice` 双轨**: 先 `router.match(dev)` 看 profile 命中:
+  - 命中 → 走 profile.buildEndpoint,endpointMeta 标 `__profile_id`
+  - 不命中 → fall-through 走旧 buildEndpoint switch case (light/cover/scene_controller/climate/lock/sensor/camera/普通 switch 暂未迁,仍硬编码)
+- **`handleDeviceStateChange` 双轨**: 看 `meta.__profile_id` 命中 → profile.pushState,跳过旧 case-by-case
+- 净化器之前在 index.ts 占的 ~200 行(buildEndpoint switch case + helpers + endpointMeta isAirPurifier)代码冗余可清,但本轮保留兼容,等 8 个 profile 全迁完再统一删。
+
+### Roadmap
+
+下一轮(v0.6.x)迁剩余 7 类:light / cover / climate / lock / sensor / scene_controller / camera-motion / switch-fallback。每个一个 PR / 一个文件。全迁完 v0.7.0 删除旧 buildEndpoint switch case。
+
 ## [0.5.2] — 2026-05-10
 
 ### Fixed

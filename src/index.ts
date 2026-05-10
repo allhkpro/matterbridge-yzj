@@ -50,11 +50,16 @@ import {
 } from "matterbridge";
 
 import { type AnsiLogger } from "matterbridge/logger";
+
+import { ProfileRouter } from "./profiles/router.js";
+import { buildRouter } from "./profiles/register.js";
+import type { ProfileContext } from "./profiles/types.js";
 import {
   AirQuality,
   BooleanState,
   BridgedDeviceBasicInformation,
   DoorLock,
+  FanControl,
   HepaFilterMonitoring,
   LevelControl,
   OccupancySensing,
@@ -180,10 +185,17 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
     composedTemp: boolean;
     composedHumidity: boolean;
     composedAqi: boolean;
-    /** L1-9: 净化器/加湿器/除湿器的耗材寿命(滤芯/水箱)曝光成 PowerSource
-     *  Replaceable Battery,iOS Home 在卡片标头显示电量条 + 低于 10% 出红色告警。
-     *  yzj 字段约定 state.filter_life 0..100 (剩余 %)。 */
+    /** v0.5.2 起: 滤芯走 HepaFilterMonitoring cluster (条件 0..100 + Ok/Warning/Critical),
+     *  不再用 PowerSource Replaceable Battery 假装电池。yzj state.filter_life 0..100。 */
     composedFilterLife: boolean;
+    /** v0.5.3: 净化器特征(state.aqi 是数字)→ device-type 升级到 airPurifier,
+     *  自带 fanControl cluster。SSE state 同步 percentSetting + fanMode 到 iPhone。 */
+    isAirPurifier: boolean;
+    /** v0.6.0+: 走 profile framework 时,这两个字段标识哪个 profile 接管,
+     *  handleDeviceStateChange 看到 __profile_id 优先调 profile.pushState。
+     *  旧 case-by-case 推送逻辑跳过。 */
+    __profile_id?: string;
+    __profile_meta?: unknown;
   }>();
   private allowedCategories: Set<string>;
   private deviceIdBlocklist: Set<string>;
@@ -225,11 +237,27 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
       "unifi_protect.69fee5d8",  // Camera-69fee5d8
     ]);
 
+    // v0.6.0: profile-driven router。具体 profile 命中走新 framework,
+    // 没命中(eg. 灯/窗帘/Pico/普通插座/温感等还没迁的)走 index.ts 旧 buildEndpoint switch case。
+    this.router = buildRouter();
     this.log.info(
       `yzj-platform init. agentUrl=${this.agentUrl} ` +
       `categories=[${[...this.allowedCategories].join(",")}] ` +
-      `blocklist=[${[...this.deviceIdBlocklist].join(",")}]`,
+      `blocklist=[${[...this.deviceIdBlocklist].join(",")}] ` +
+      `profiles=[${this.router.list().map(p => p.id).join(",")}]`,
     );
+  }
+
+  private readonly router: ProfileRouter;
+
+  /** 给 profile 调 yzj-agent / log 用 */
+  private profileContext(): ProfileContext {
+    return {
+      log: this.log,
+      agentUrl: this.agentUrl,
+      sendCommand: (id, cmd, body) => this.sendCommand(id, cmd, body ?? {}),
+      handleCommandSafely: (id, cmd, body) => this.handleCommandSafely(id, cmd, body ?? {}),
+    };
   }
 
   private get agentUrl(): string {
@@ -374,6 +402,42 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
       return false;
     }
 
+    // v0.6.0: profile router 优先 — 命中具体 profile 就走 framework 路径,
+    // 不命中(还没迁的设备类)走下面旧 buildEndpoint switch case 兜底。
+    const profile = this.router.match(dev);
+    if (profile) {
+      try {
+        const safeId = dev.device_id.replace(/[^A-Za-z0-9_-]/g, "_");
+        const serial = `YZJ-${safeId}`.slice(0, 32);
+        const model = `${MODEL_PREFIX}-${dev.category}`;
+        const { ep, meta } = await profile.buildEndpoint(dev, this.profileContext(), safeId, serial, model);
+        await this.registerDevice(ep);
+        this.endpoints.set(dev.device_id, ep);
+        // profile 路径 endpointMeta 有 __profile_id,handleDeviceStateChange 看它分流。
+        // 同时填一些旧字段兼容,但旧 push 路径在 cat==="switch" 时用 isAirPurifier
+        // 等 flag 现在都是 false,自然不命中,所以新 profile 接管不会重复推送。
+        this.endpointMeta.set(dev.device_id, {
+          category: dev.category,
+          hasLevelControl: false,
+          hasColorTemp: false,
+          hasRgb: false,
+          composedTemp: false,
+          composedHumidity: false,
+          composedAqi: false,
+          composedFilterLife: false,
+          isAirPurifier: false,
+          // profile 标记 — handleDeviceStateChange 拿这个反查路由
+          __profile_id: profile.id,
+          __profile_meta: meta,
+        });
+        this.log.info(`Profile route: ${dev.device_id} → ${profile.id}`);
+        return true;
+      } catch (err) {
+        this.log.error(`Profile ${profile.id} failed for ${dev.device_id}: ${(err as Error).message}; falling back to legacy buildEndpoint`);
+        // fall through 走旧 buildEndpoint
+      }
+    }
+
     try {
       const ep = await this.buildEndpoint(dev);
       if (ep) {
@@ -389,6 +453,7 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
         const composedHumidity = dev.category === "switch" && typeof dev.state?.humidity === "number";
         const composedAqi = dev.category === "switch" && typeof dev.state?.aqi === "number";
         const composedFilterLife = dev.category === "switch" && typeof dev.state?.filter_life === "number";
+        const isAirPurifier = dev.category === "switch" && typeof dev.state?.aqi === "number";
         this.endpointMeta.set(dev.device_id, {
           category: dev.category,
           hasLevelControl,
@@ -398,6 +463,7 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
           composedHumidity,
           composedAqi,
           composedFilterLife,
+          isAirPurifier,
         });
         return true;
       }
@@ -576,6 +642,26 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
             .createDefaultBridgedDeviceBasicInformationClusterServer(dev.name, serial, VID, MANUFACTURER, model)
             .createDefaultGroupsClusterServer()
             .createDefaultOnOffClusterServer(this.deriveOnOff(dev));
+
+          // FanControl cluster — 用 MultiSpeed 版,因为米家净化器 favorite_level 是 0..16
+          // 多档位,正好匹配 Matter MultiSpeed feature。同时 Auto feature 让 iOS 显示
+          // "Auto" 模式选项,匹配米家 mode=auto。
+          const initFm = this.yzjModeToMatterFanMode(
+            dev.state?.mode as string | undefined,
+            dev.state?.favorite_level as number | undefined,
+          );
+          const initFavLevel = (dev.state?.favorite_level as number | undefined) ?? 0;
+          const initPct = Math.max(0, Math.min(100, Math.round((initFavLevel / 16) * 100)));
+          ep.createMultiSpeedFanControlClusterServer(
+            initFm,
+            FanControl.FanModeSequence.OffLowMedHighAuto,
+            initPct,                 // percentSetting (iPhone 滑块写这个 0..100)
+            initPct,                 // percentCurrent (read-only echo)
+            16,                      // speedMax (米家 favorite_level 上限)
+            initFavLevel,            // speedSetting (iPhone 档位写这个 0..speedMax)
+            initFavLevel,            // speedCurrent (read-only echo)
+          );
+
           // HepaFilterMonitoring cluster: 滤芯 condition (0..100) + Ok/Warning/Critical
           if (typeof dev.state?.filter_life === "number") {
             const flLife = Math.max(0, Math.min(100, dev.state.filter_life as number));
@@ -603,6 +689,40 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
         ep.addCommandHandler("off", async () => {
           await this.handleCommandSafely(dev.device_id, "turn_off", {});
         });
+
+        // v0.5.3: airPurifier fanControl attribute write listener。
+        // iPhone Apple Home 拉风速滑块 / 选风速档 → matter.js 写 percentSetting / fanMode,
+        // subscribeAttribute 触发 listener 路由到 yzj-agent 米家命令(set_favorite_level + set_mode)。
+        if (isAirPurifier) {
+          // 风速百分比 → 米家 favorite_level (0-16)
+          ep.subscribeAttribute(
+            "fanControl",
+            "percentSetting",
+            async (newVal: number, oldVal: number) => {
+              if (typeof newVal !== "number" || newVal === oldVal) return;
+              if (newVal === 0) return; // 0% 走 OnOff cluster off,这边不重复发
+              const level = Math.max(1, Math.min(16, Math.round((newVal / 100) * 16)));
+              await this.handleCommandSafely(dev.device_id, "turn_on", {
+                mode: "favorite",
+                favorite_level: level,
+              });
+            },
+            this.log,
+          );
+
+          // 风速模式枚举 → 米家 mode
+          ep.subscribeAttribute(
+            "fanControl",
+            "fanMode",
+            async (newVal: FanControl.FanMode, oldVal: FanControl.FanMode) => {
+              if (newVal === oldVal) return;
+              const yzjMode = this.matterFanModeToYzjMode(newVal);
+              if (!yzjMode) return; // Off 走 OnOff,不在这处理
+              await this.handleCommandSafely(dev.device_id, "turn_on", { mode: yzjMode });
+            },
+            this.log,
+          );
+        }
 
         // 复合子 sensor: 净化器 / 加湿器 等同时携带 temperature / humidity / aqi 时挂上,
         // iOS 卡片下方显示读数。
@@ -729,6 +849,47 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
     if (life > 30) return ResourceMonitoring.ChangeIndication.Ok;
     if (life > 10) return ResourceMonitoring.ChangeIndication.Warning;
     return ResourceMonitoring.ChangeIndication.Critical;
+  }
+
+  /** Matter FanControl.FanMode → 米家空气净化器 mode 字符串。
+   *  米家枚举 (从 yzj xiaomi adapter OperationMode):
+   *    auto / silent / favorite / idle
+   *  Apple Home iOS 卡片显示 fanMode 选择器,我们映射:
+   *    Off    → null   (走 OnOff cluster,不在这管)
+   *    Low    → silent
+   *    Medium / High / On → favorite (favorite_level 由 percentSetting 一起决定)
+   *    Auto / Smart → auto
+   */
+  private matterFanModeToYzjMode(fm: FanControl.FanMode): string | null {
+    switch (fm) {
+      case FanControl.FanMode.Off:    return null;
+      case FanControl.FanMode.Low:    return "silent";
+      case FanControl.FanMode.Medium: return "favorite";
+      case FanControl.FanMode.High:   return "favorite";
+      case FanControl.FanMode.On:     return "favorite";
+      case FanControl.FanMode.Auto:   return "auto";
+      case FanControl.FanMode.Smart:  return "auto";
+      default: return null;
+    }
+  }
+
+  /** 反向: yzj 米家 mode + favorite_level → Matter FanMode。
+   *  在 buildEndpoint 初始化时给 fanControl 设默认值用,
+   *  以及 SSE 状态推送回 iPhone 时更新 fanMode attribute。 */
+  private yzjModeToMatterFanMode(yzjMode: string | undefined, favLevel: number | undefined): FanControl.FanMode {
+    switch ((yzjMode || "").toLowerCase()) {
+      case "auto":     return FanControl.FanMode.Auto;
+      case "silent":   return FanControl.FanMode.Low;
+      case "favorite":
+        if (typeof favLevel === "number") {
+          if (favLevel <= 5)  return FanControl.FanMode.Low;
+          if (favLevel <= 11) return FanControl.FanMode.Medium;
+          return FanControl.FanMode.High;
+        }
+        return FanControl.FanMode.Medium;
+      case "idle":     return FanControl.FanMode.Off;
+      default:         return FanControl.FanMode.Auto;
+    }
   }
 
   /** AQI (PM2.5 μg/m³) → Matter AirQualityEnum 6 级桶。
@@ -942,6 +1103,20 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
     const meta = this.endpointMeta.get(deviceId);
     const cat = meta?.category ?? "";
 
+    // v0.6.0: profile router 命中过的端点 → 走 profile.pushState 完整状态推送,
+    // 跳过下面的旧 case-by-case 分发。
+    if (meta?.__profile_id) {
+      const profile = this.router.profileById(meta.__profile_id);
+      if (profile) {
+        try {
+          await profile.pushState(ep, meta.__profile_meta as Record<string, unknown>, state, this.profileContext());
+        } catch (err) {
+          this.log.error(`Profile ${profile.id} pushState failed for ${deviceId}: ${(err as Error).message}`);
+        }
+        return;
+      }
+    }
+
     // L1-3: Reachable mirror — yzj.online → BridgedDeviceBasicInformation.Reachable
     // (every bridged endpoint has BridgedDeviceBasicInformation by definition).
     if (typeof state.online === "boolean") {
@@ -991,6 +1166,25 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
           this.filterLifeToChangeIndication(flLife),
           this.log,
         );
+      }
+
+      // v0.5.3: 净化器 fanControl 状态回传 — 米家端(物理面板 / 米家 App / yzj 手机端)
+      // 改了 favorite_level / mode 时,SSE 推过来,我们把 percentSetting + fanMode 也
+      // 同步到 Matter cluster,iPhone Apple 家庭 app 跟着刷新风速档。
+      // 注意:写 percentSetting 会触发 subscribeAttribute listener 回头 POST yzj
+      // (newVal === oldVal 短路),但我们刚从 yzj 收到的就是这值,这条短路命中,
+      // 不会形成回环。
+      if (meta?.isAirPurifier) {
+        if (typeof state.favorite_level === "number") {
+          const level = Math.max(0, Math.min(16, state.favorite_level));
+          const pct = Math.round((level / 16) * 100);
+          await ep.setAttribute("fanControl", "percentSetting", pct, this.log);
+          await ep.setAttribute("fanControl", "percentCurrent", pct, this.log);
+        }
+        if (typeof state.mode === "string") {
+          const fm = this.yzjModeToMatterFanMode(state.mode, state.favorite_level as number | undefined);
+          await ep.setAttribute("fanControl", "fanMode", fm, this.log);
+        }
       }
     }
 
