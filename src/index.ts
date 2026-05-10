@@ -132,12 +132,16 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
     await this.ready;
     await this.clearSelect();
 
-    let devices: YzjDevice[];
-    try {
-      devices = await this.fetchDevices();
-    } catch (err) {
-      this.log.error(`Failed to fetch devices from yzj-agent at ${this.agentUrl}: ${(err as Error).message}`);
-      this.log.warn(`Plugin starting with 0 endpoints; restart Matterbridge after agent is up.`);
+    // L2-3: yzj-agent may not be up yet (launchd doesn't guarantee start order).
+    // Retry with backoff until reachable, then proceed. We never block forever —
+    // after maxAttempts we register 0 endpoints and rely on SSE reconnect path
+    // to discover devices once agent is up.
+    const devices = await this.fetchDevicesWithRetry();
+    if (devices === null) {
+      this.log.warn(
+        `yzj-agent at ${this.agentUrl} unreachable after retries; ` +
+        `starting with 0 endpoints. SSE reconnect loop will pick up devices when agent is up.`,
+      );
       return;
     }
 
@@ -149,6 +153,26 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
     }
 
     this.log.info(`Registered ${registered} yzj device(s) as Matter bridged endpoints`);
+  }
+
+  /** Retry yzj-agent /api/agent/devices with exponential backoff. Returns null
+   *  after maxAttempts so plugin can start in degraded mode (SSE will recover). */
+  private async fetchDevicesWithRetry(maxAttempts = 6): Promise<YzjDevice[] | null> {
+    let delay = 1000;  // 1s, 2s, 4s, 8s, 16s, 32s = ~1 min total
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await this.fetchDevices();
+      } catch (err) {
+        this.log.warn(
+          `Fetch yzj-agent devices attempt ${attempt}/${maxAttempts} failed: ${(err as Error).message}` +
+            (attempt < maxAttempts ? `; retry in ${delay / 1000}s` : ""),
+        );
+        if (attempt >= maxAttempts) return null;
+        await new Promise((r) => setTimeout(r, delay));
+        delay = Math.min(delay * 2, 30_000);
+      }
+    }
+    return null;
   }
 
   // ─── Lifecycle: onConfigure (subscribe SSE) ────────────────────────────────
@@ -396,17 +420,77 @@ export class YzjPlatform extends MatterbridgeDynamicPlatform {
   private startSseSubscription(): void {
     this.sseAbort = new AbortController();
     const abort = this.sseAbort;
+    let consecutiveFailures = 0;
+
     void (async () => {
       while (!abort.signal.aborted) {
         try {
+          // L2-5: on (re)connect, do a full state sync so we don't miss state
+          // changes that happened during the disconnect window. First-connect
+          // sync is a no-op if onStart already pulled devices; we still re-fetch
+          // current state to catch any updates between onStart and onConfigure.
+          await this.fullStateSync();
+
+          consecutiveFailures = 0;
           await this.runSseLoop(abort.signal);
         } catch (err) {
           if (abort.signal.aborted) return;
-          this.log.warn(`SSE disconnected (${(err as Error).message}), reconnecting in 5s`);
-          await new Promise((r) => setTimeout(r, 5000));
+
+          consecutiveFailures++;
+          // Backoff: 5s for first few, then 15s, 30s, capped at 60s.
+          const delay = consecutiveFailures <= 2 ? 5000 : consecutiveFailures <= 5 ? 15_000 : Math.min(60_000, consecutiveFailures * 10_000);
+          // Aggregate repeat errors: log only on transitions and every 5th retry.
+          if (consecutiveFailures <= 3 || consecutiveFailures % 5 === 0) {
+            this.log.warn(`SSE disconnected (${(err as Error).message}); failure #${consecutiveFailures}, retry in ${delay / 1000}s`);
+          }
+          await new Promise((r) => setTimeout(r, delay));
         }
       }
     })();
+  }
+
+  /** Pull current device list and reconcile state for already-registered
+   *  endpoints. Hot-add for new devices that appeared while we were
+   *  disconnected. Hot-remove handled lazily — devices that have disappeared
+   *  in yzj-agent stay registered as Reachable=false until next plugin restart. */
+  private async fullStateSync(): Promise<void> {
+    let devices: YzjDevice[];
+    try {
+      devices = await this.fetchDevices();
+    } catch (err) {
+      throw new Error(`fullStateSync fetch failed: ${(err as Error).message}`);
+    }
+
+    const seen = new Set<string>();
+    let added = 0;
+    let synced = 0;
+
+    for (const dev of devices) {
+      seen.add(dev.device_id);
+
+      if (this.endpoints.has(dev.device_id)) {
+        // Already registered — just push state change (covers state drift
+        // during disconnect).
+        await this.handleDeviceStateChange(dev.device_id, { ...dev.state, online: dev.online });
+        synced++;
+      } else if (await this.tryRegisterDevice(dev)) {
+        added++;
+      }
+    }
+
+    // Mark devices that disappeared as Reachable=false (don't unregister —
+    // they may come back; full unregister happens on adapter.*.removed event).
+    for (const [deviceId, ep] of this.endpoints) {
+      if (!seen.has(deviceId)) {
+        try {
+          await ep.setAttribute(BridgedDeviceBasicInformation.Cluster.id, "reachable", false, this.log);
+        } catch { /* not all endpoints have this cluster */ }
+      }
+    }
+
+    if (added > 0 || this.endpoints.size > 0) {
+      this.log.info(`fullStateSync: synced=${synced} added=${added} (total=${this.endpoints.size})`);
+    }
   }
 
   private async runSseLoop(abort: AbortSignal): Promise<void> {
